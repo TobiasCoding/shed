@@ -72,6 +72,141 @@ func promptRepoPassword(job Job, title string, label string, win fyne.Window, on
 	dlg.Show()
 }
 
+// applyFileColumnWidths sets the widths of the file diff table columns using
+// the values stored in the configuration. When no widths exist the previous
+// fixed values are used. This function does not modify the configuration.
+func applyFileColumnWidths() {
+	if filesTable == nil {
+		return
+	}
+	const fileCols = 5
+	widths := cfg.FileColWidths
+	if len(widths) != fileCols {
+		// fallback a los valores fijos originales
+		widths = []float32{30, 600, 80, 150, 150}
+	}
+	for col, w := range widths {
+		filesTable.SetColumnWidth(col, w)
+	}
+}
+
+// measureTextWidth returns an approximate pixel width for the given string
+// using the current theme text size plus a small padding so that content does
+// not touch the cell borders.
+func measureTextWidth(s string) float32 {
+	if s == "" {
+		s = " "
+	}
+	sz := fyne.MeasureText(s, theme.TextSize(), fyne.TextStyle{})
+	// padding a ambos lados
+	return sz.Width + 16
+}
+
+// autoSnapshotColumnWidths inspects the snapshot data and computes column
+// widths large enough to hold the visible content (ID, dates, host, etc.)
+// without truncation where possible. The result can be stored in Config and
+// reused on future runs.
+func autoSnapshotColumnWidths() []float32 {
+	const snapCols = 6
+	widths := make([]float32, snapCols)
+	headers := []string{"ID", "Date", "Time", "Host", "#Paths", "Tags"}
+	for i, h := range headers {
+		w := measureTextWidth(h)
+		if w > widths[i] {
+			widths[i] = w
+		}
+	}
+	for _, s := range filterSnapshots {
+		values := []string{
+			s.ShortID,
+			s.Time.Format("02/01/2006"),
+			s.Time.Format("15:04:05"),
+			s.Hostname,
+			strconv.Itoa(len(s.Paths)),
+			strings.Join(s.Tags, ","),
+		}
+		for i, v := range values {
+			w := measureTextWidth(v)
+			if w > widths[i] {
+				widths[i] = w
+			}
+		}
+	}
+	// mínimos / máximos razonables
+	min := []float32{80, 80, 70, 120, 60, 120}
+	const maxWidth float32 = 700
+	for i := range widths {
+		if widths[i] < min[i] {
+			widths[i] = min[i]
+		}
+		if widths[i] > maxWidth {
+			widths[i] = maxWidth
+		}
+	}
+	return widths
+}
+
+// autoFileColumnWidths inspects the file diff data and computes column widths
+// based on the visible content. It is typically called after allFiles /
+// filterFiles have been populated.
+func autoFileColumnWidths() []float32 {
+	const fileCols = 5
+	widths := make([]float32, fileCols)
+	headers := []string{"Δ", "Path", "Size", "Modified", "Created"}
+	for i, h := range headers {
+		w := measureTextWidth(h)
+		if w > widths[i] {
+			widths[i] = w
+		}
+	}
+	for _, f := range filterFiles {
+		values := []string{
+			f.Change,
+			f.Path,
+			f.Size,
+			f.MTime,
+			f.CTime,
+		}
+		for i, v := range values {
+			w := measureTextWidth(v)
+			if w > widths[i] {
+				widths[i] = w
+			}
+		}
+	}
+	// mínimos/máximos; Path puede ser más ancho
+	min := []float32{30, 150, 70, 120, 120}
+	max := []float32{80, 800, 200, 300, 300}
+	for i := range widths {
+		if widths[i] < min[i] {
+			widths[i] = min[i]
+		}
+		if widths[i] > max[i] {
+			widths[i] = max[i]
+		}
+	}
+	return widths
+}
+
+// applySnapshotColumnWidths sets the widths of the snapshot table columns
+// using the values stored in the configuration. When no widths have been
+// persisted yet it falls back to sensible defaults that match the original
+// fixed layout. This function does not modify the configuration.
+func applySnapshotColumnWidths() {
+	if snapTable == nil {
+		return
+	}
+	const snapCols = 6
+	widths := cfg.SnapColWidths
+	if len(widths) != snapCols {
+		// fallback a los valores fijos originales
+		widths = []float32{110, 90, 85, 160, 70, 250}
+	}
+	for col, w := range widths {
+		snapTable.SetColumnWidth(col, w)
+	}
+}
+
 // buildUI constructs the entire application user interface. It takes the
 // application instance and returns the main window. The UI is divided into
 // left and right panels. The left panel lists jobs and provides job
@@ -111,25 +246,25 @@ func buildUI(myApp fyne.App) fyne.Window {
 		},
 	)
 	selectedJobIndex := -1
-	addBtn := widget.NewButtonWithIcon("Add", theme.ContentAddIcon(), func() {
+	addBtn := widget.NewButtonWithIcon("Add Job", theme.ContentAddIcon(), func() {
 		showJobEditor(win, -1, jobList)
 	})
-	editBtn := widget.NewButton("Edit", func() {
+	editBtn := widget.NewButton("Edit Job", func() {
 		if selectedJobIndex < 0 || selectedJobIndex >= len(cfg.Jobs) {
-			dialog.ShowInformation("Edit", "Please select a job first.", win)
+			dialog.ShowInformation("Edit Job", "Please select a job first.", win)
 			return
 		}
 		showJobEditor(win, selectedJobIndex, jobList)
 	})
-	deleteBtn := widget.NewButton("Delete", func() {
+	deleteBtn := widget.NewButton("Delete Job", func() {
 		if selectedJobIndex < 0 || selectedJobIndex >= len(cfg.Jobs) {
-			dialog.ShowInformation("Delete", "Please select a job first.", win)
+			dialog.ShowInformation("Delete Job", "Please select a job first.", win)
 			return
 		}
 		job := cfg.Jobs[selectedJobIndex]
 		dialog.ShowConfirm(
-			"Delete",
-			fmt.Sprintf("Delete %q? Snapshots are NOT deleted from disk.", job.Name),
+			"Delete Job",
+			fmt.Sprintf("Delete job %q? Snapshots are NOT deleted from disk.", job.Name),
 			func(ok bool) {
 				if !ok {
 					return
@@ -170,23 +305,18 @@ func buildUI(myApp fyne.App) fyne.Window {
 	snapSearch.SetPlaceHolder("Search snapshots…")
 	snapSearchBtn := widget.NewButtonWithIcon("", theme.SearchIcon(), func() {})
 	snapSearchRow := container.NewBorder(nil, nil, nil, snapSearchBtn, snapSearch)
-
 	rebuildSnapFilter("")
-
 	snapTable = widget.NewTable(
-		// ahora sólo filas de datos, sin fila 0 de header
 		func() (int, int) { return len(filterSnapshots), 6 },
 		func() fyne.CanvasObject { return widget.NewLabel("") },
 		func(id widget.TableCellID, o fyne.CanvasObject) {
 			l := o.(*widget.Label)
 			l.Wrapping = fyne.TextTruncate
-
 			row := id.Row
 			if row < 0 || row >= len(filterSnapshots) {
 				l.SetText("")
 				return
 			}
-
 			s := filterSnapshots[row]
 			switch id.Col {
 			case 0:
@@ -206,8 +336,7 @@ func buildUI(myApp fyne.App) fyne.Window {
 			}
 		},
 	)
-
-	// Usar header nativo de Table para permitir resize por drag
+	// usar fila de header nativa de Table para permitir resize por drag
 	snapTable.ShowHeaderRow = true
 	snapTable.CreateHeader = func() fyne.CanvasObject {
 		return widget.NewLabel("")
@@ -216,7 +345,6 @@ func buildUI(myApp fyne.App) fyne.Window {
 		l := o.(*widget.Label)
 		l.Wrapping = fyne.TextTruncate
 
-		// id.Row < 0 == celda de header
 		if id.Row < 0 {
 			switch id.Col {
 			case 0:
@@ -238,7 +366,6 @@ func buildUI(myApp fyne.App) fyne.Window {
 			l.SetText("")
 		}
 	}
-
 	applySnapshotColumnWidths()
 
 	// ---- Files panel
@@ -246,23 +373,18 @@ func buildUI(myApp fyne.App) fyne.Window {
 	fileSearch.SetPlaceHolder("Search files…")
 	fileSearchBtn := widget.NewButtonWithIcon("", theme.SearchIcon(), func() {})
 	fileSearchRow := container.NewBorder(nil, nil, nil, fileSearchBtn, fileSearch)
-
 	rebuildFilesFilter("")
-
 	filesTable = widget.NewTable(
-		// sólo filas de datos
 		func() (int, int) { return len(filterFiles), 5 },
 		func() fyne.CanvasObject { return widget.NewLabel("") },
 		func(id widget.TableCellID, o fyne.CanvasObject) {
 			l := o.(*widget.Label)
 			l.Wrapping = fyne.TextTruncate
-
 			row := id.Row
 			if row < 0 || row >= len(filterFiles) {
 				l.SetText("")
 				return
 			}
-
 			f := filterFiles[row]
 			switch id.Col {
 			case 0:
@@ -284,8 +406,6 @@ func buildUI(myApp fyne.App) fyne.Window {
 			}
 		},
 	)
-
-	// Header nativo para poder arrastrar los bordes
 	filesTable.ShowHeaderRow = true
 	filesTable.CreateHeader = func() fyne.CanvasObject {
 		return widget.NewLabel("")
@@ -293,7 +413,6 @@ func buildUI(myApp fyne.App) fyne.Window {
 	filesTable.UpdateHeader = func(id widget.TableCellID, o fyne.CanvasObject) {
 		l := o.(*widget.Label)
 		l.Wrapping = fyne.TextTruncate
-
 		if id.Row < 0 {
 			switch id.Col {
 			case 0:
@@ -313,15 +432,11 @@ func buildUI(myApp fyne.App) fyne.Window {
 			l.SetText("")
 		}
 	}
-
 	applyFileColumnWidths()
 
 	// ---- snapshot selection hook
 	snapTable.OnSelected = func(id widget.TableCellID) {
-		if id.Row == 0 {
-			return
-		}
-		r := id.Row - 1
+		r := id.Row
 		if r < 0 || r >= len(filterSnapshots) {
 			return
 		}
@@ -351,7 +466,6 @@ func buildUI(myApp fyne.App) fyne.Window {
 			allFiles = rows
 			rebuildFilesFilter(fileSearch.Text)
 			// Auto-ajuste de columnas de files la primera vez que hay datos.
-			// Se calcula en base al contenido y se persiste en config.
 			if len(cfg.FileColWidths) == 0 {
 				cfg.FileColWidths = autoFileColumnWidths()
 				if err := saveConfig(cfg); err != nil && enableLogs {
@@ -378,12 +492,10 @@ func buildUI(myApp fyne.App) fyne.Window {
 		// Caso BitLocker: no persistimos contraseña, la pedimos (o usamos cache)
 		if job.Bitlocker {
 			promptRepoPassword(job, "Enter Password", "BitLocker & Backup Password", win, func(pw string) {
-				// Intentamos desbloquear la unidad sólo si hace falta.
 				if err := unlockBitlocker(job.Source, pw); err != nil {
 					dialog.ShowError(err, win)
 					return
 				}
-				// La misma contraseña se usa para el repo de restic.
 				setJobPassword(job.Name, pw)
 				runBackupWithPassword(job, pw)
 			})
@@ -429,13 +541,13 @@ func buildUI(myApp fyne.App) fyne.Window {
 
 		if job.Bitlocker {
 			promptRepoPassword(job, "Enter Password", "1 Repo Password", win, func(_ string) {
-				// ya queda cacheada; restoreSnapshot usará effectivePassword
 				doRestore()
 			})
 		} else {
 			doRestore()
 		}
 	})
+
 	// live search hooks
 	snapSearch.OnChanged = func(s string) {
 		rebuildSnapFilter(s)
@@ -445,6 +557,7 @@ func buildUI(myApp fyne.App) fyne.Window {
 		rebuildFilesFilter(s)
 		filesTable.Refresh()
 	}
+
 	// assemble right panels
 	snapTop := container.NewBorder(
 		container.NewHBox(backupBtn, restoreBtn), nil, nil, nil,
@@ -514,12 +627,63 @@ func buildUI(myApp fyne.App) fyne.Window {
 	if len(cfg.Jobs) > 0 && len(filterJobIdx) > 0 {
 		jobList.Select(0)
 	}
+
 	// top bar with about button on right
 	topBar := container.NewBorder(nil, nil, nil, aboutBtn, nil)
 	mainSplit := container.NewHSplit(left, rightSplit)
 	mainSplit.Offset = 0.32
 	root := container.NewBorder(topBar, statusLabel, nil, nil, mainSplit)
 	win.SetContent(root)
+
+	// watcher periódico: persiste config cuando cambian los anchos de columnas
+	go func() {
+		ticker := time.NewTicker(1 * time.Second)
+		defer ticker.Stop()
+
+		for range ticker.C {
+			// si ya no hay ventanas, salimos (app cerrándose)
+			if len(fyne.CurrentApp().Driver().AllWindows()) == 0 {
+				return
+			}
+
+			changed := false
+
+			if snapTable != nil {
+				newW := grabTableColumnWidths(snapTable, 6, cfg.SnapColWidths)
+				if !float32SlicesEqual(newW, cfg.SnapColWidths) {
+					cfg.SnapColWidths = newW
+					changed = true
+				}
+			}
+			if filesTable != nil {
+				newW := grabTableColumnWidths(filesTable, 5, cfg.FileColWidths)
+				if !float32SlicesEqual(newW, cfg.FileColWidths) {
+					cfg.FileColWidths = newW
+					changed = true
+				}
+			}
+
+			if changed {
+				if err := saveConfig(cfg); err != nil && enableLogs {
+					logPrintf("could not save config on width change: %v", err)
+				}
+			}
+		}
+	}()
+
+	// al cerrar la ventana guardamos los anchos actuales de las columnas (último flush)
+	win.SetOnClosed(func() {
+		if snapTable != nil {
+			cfg.SnapColWidths = grabTableColumnWidths(snapTable, 6, cfg.SnapColWidths)
+		}
+		if filesTable != nil {
+			cfg.FileColWidths = grabTableColumnWidths(filesTable, 5, cfg.FileColWidths)
+		}
+		if err := saveConfig(cfg); err != nil && enableLogs {
+			logPrintf("could not save config on close: %v", err)
+		}
+	})
+
 	setStatus("Ready")
 	return win
 }
@@ -658,6 +822,19 @@ func rebuildFilesFilter(q string) {
 			filterFiles = append(filterFiles, f)
 		}
 	}
+}
+
+// float32SlicesEqual compara dos slices de float32
+func float32SlicesEqual(a, b []float32) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // showJobEditor opens a dialog allowing the user to create or edit a job.
@@ -857,139 +1034,4 @@ func showSettings(parent fyne.Window) {
 	w.SetContent(container.NewVScroll(form))
 	w.Resize(fyne.NewSize(560, 220))
 	w.Show()
-}
-
-// applySnapshotColumnWidths sets the widths of the snapshot table columns
-// using the values stored in the configuration. When no widths have been
-// persisted yet it falls back to sensible defaults that match the original
-// fixed layout. This function does not modify the configuration.
-func applySnapshotColumnWidths() {
-	if snapTable == nil {
-		return
-	}
-	const snapCols = 6
-	widths := cfg.SnapColWidths
-	if len(widths) != snapCols {
-		// fallback to the previous fixed widths so the table is usable
-		widths = []float32{110, 90, 85, 160, 70, 250}
-	}
-	for col, w := range widths {
-		snapTable.SetColumnWidth(col, w)
-	}
-}
-
-// applyFileColumnWidths sets the widths of the file diff table columns using
-// the values stored in the configuration. When no widths exist the previous
-// fixed values are used. This function does not modify the configuration.
-func applyFileColumnWidths() {
-	if filesTable == nil {
-		return
-	}
-	const fileCols = 5
-	widths := cfg.FileColWidths
-	if len(widths) != fileCols {
-		// fallback to the previous fixed widths so the table is usable
-		widths = []float32{30, 600, 80, 150, 150}
-	}
-	for col, w := range widths {
-		filesTable.SetColumnWidth(col, w)
-	}
-}
-
-// measureTextWidth returns an approximate pixel width for the given string
-// using the current theme text size plus a small padding so that content does
-// not touch the cell borders.
-func measureTextWidth(s string) float32 {
-	if s == "" {
-		s = " "
-	}
-	sz := fyne.MeasureText(s, theme.TextSize(), fyne.TextStyle{})
-	// add padding on both sides
-	return sz.Width + 16
-}
-
-// autoSnapshotColumnWidths inspects the snapshot data and computes column
-// widths large enough to hold the visible content (ID, dates, host, etc.)
-// without truncation where possible. The result can be stored in Config and
-// reused on future runs.
-func autoSnapshotColumnWidths() []float32 {
-	const snapCols = 6
-	widths := make([]float32, snapCols)
-	headers := []string{"ID", "Date", "Time", "Host", "#Paths", "Tags"}
-	for i, h := range headers {
-		w := measureTextWidth(h)
-		if w > widths[i] {
-			widths[i] = w
-		}
-	}
-	for _, s := range filterSnapshots {
-		values := []string{
-			s.ShortID,
-			s.Time.Format("02/01/2006"),
-			s.Time.Format("15:04:05"),
-			s.Hostname,
-			strconv.Itoa(len(s.Paths)),
-			strings.Join(s.Tags, ","),
-		}
-		for i, v := range values {
-			w := measureTextWidth(v)
-			if w > widths[i] {
-				widths[i] = w
-			}
-		}
-	}
-	// enforce reasonable minimums and maximums so columns stay readable
-	min := []float32{80, 80, 70, 120, 60, 120}
-	const maxWidth float32 = 700
-	for i := range widths {
-		if widths[i] < min[i] {
-			widths[i] = min[i]
-		}
-		if widths[i] > maxWidth {
-			widths[i] = maxWidth
-		}
-	}
-	return widths
-}
-
-// autoFileColumnWidths inspects the file diff data and computes column widths
-// based on the visible content. It is typically called after allFiles /
-// filterFiles have been populated.
-func autoFileColumnWidths() []float32 {
-	const fileCols = 5
-	widths := make([]float32, fileCols)
-	headers := []string{"Δ", "Path", "Size", "Modified", "Created"}
-	for i, h := range headers {
-		w := measureTextWidth(h)
-		if w > widths[i] {
-			widths[i] = w
-		}
-	}
-	for _, f := range filterFiles {
-		values := []string{
-			f.Change,
-			f.Path,
-			f.Size,
-			f.MTime,
-			f.CTime,
-		}
-		for i, v := range values {
-			w := measureTextWidth(v)
-			if w > widths[i] {
-				widths[i] = w
-			}
-		}
-	}
-	// enforce minimums and maximums; the path column is allowed to be wider
-	min := []float32{30, 150, 70, 120, 120}
-	max := []float32{80, 800, 200, 300, 300}
-	for i := range widths {
-		if widths[i] < min[i] {
-			widths[i] = min[i]
-		}
-		if widths[i] > max[i] {
-			widths[i] = max[i]
-		}
-	}
-	return widths
 }
