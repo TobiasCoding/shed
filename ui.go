@@ -602,8 +602,10 @@ func buildUI(myApp fyne.App) fyne.Window {
 		job := cfg.Jobs[selectedJobIndex]
 		snap := filterSnapshots[selectedSnapIdx]
 
+		// Ejecuta el restore real (ya habiendo pedido contraseña si hace falta).
 		doRestore := func() {
 			go func(j Job, s Snapshot) {
+				// restoreSnapshot ahora devuelve la ruta Source restaurada.
 				target, err := restoreSnapshot(j, cfg.ResticPath, s.ShortID, "")
 				if err != nil {
 					fyne.CurrentApp().SendNotification(&fyne.Notification{
@@ -613,20 +615,52 @@ func buildUI(myApp fyne.App) fyne.Window {
 					dialog.ShowError(err, win)
 					return
 				}
+
+				// Notificación y barra de estado indicando restore sobre Source.
 				fyne.CurrentApp().SendNotification(&fyne.Notification{
 					Title:   "Restore completed",
-					Content: fmt.Sprintf("Restored to %s", target),
+					Content: fmt.Sprintf("Snapshot %s restored to source %s", s.ShortID, target),
 				})
-				setStatus(fmt.Sprintf("Restored %s to %s", s.ShortID, target))
+				setStatus(fmt.Sprintf("Snapshot %s restored to %s", s.ShortID, target))
+
+				// Volvemos a leer los snapshots para ver la nota nueva en la columna Tags.
+				snaps, e := listSnapshots(j, cfg.ResticPath)
+				if e == nil {
+					allSnapshots = snaps
+					rebuildSnapFilter(snapSearch.Text)
+					if snapTable != nil {
+						snapTable.Refresh()
+					}
+				} else if enableLogs {
+					logPrintf("listSnapshots after restore failed: %v", e)
+				}
 			}(job, snap)
 		}
 
-		if job.Bitlocker {
-			promptRepoPassword(job, "Enter Password", "1 Repo Password", win, func(_ string) {
+		// Confirmación explícita porque ahora se pisa la carpeta Source.
+		confirmAndRun := func() {
+			msg := fmt.Sprintf(
+				"Restore snapshot %s into Source path?\n\nSource: %s\n\n"+
+					"The current contents of this folder will be moved to:\n%s.before-restore-YYYYMMDDHHMMSS",
+				snap.ShortID,
+				job.Source,
+				job.Source,
+			)
+			dialog.ShowConfirm("Restore", msg, func(ok bool) {
+				if !ok {
+					return
+				}
 				doRestore()
+			}, win)
+		}
+
+		if job.Bitlocker {
+			// Para BitLocker, primero nos aseguramos de tener contraseña (cache).
+			promptRepoPassword(job, "Enter Password", "1 Repo Password", win, func(_ string) {
+				confirmAndRun()
 			})
 		} else {
-			doRestore()
+			confirmAndRun()
 		}
 	})
 

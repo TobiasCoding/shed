@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -248,33 +249,174 @@ func listSnapshots(job Job, resticPath string) ([]Snapshot, error) {
 	return snaps, nil
 }
 
-// restoreSnapshot restores a snapshot into a folder inside the destination
-// repository. The returned string is the path to the restore location. If
-// passwordOverride is provided it is used instead of job.RepoPassword.
+// restoreSnapshot restaura el snapshot directamente sobre la ruta Source del job.
+// 1) Ejecuta "restic restore" en una carpeta temporal dentro del repositorio.
+// 2) Renombra la carpeta Source actual a Source.before-restore-YYYYMMDDHHMMSS.
+// 3) Crea una nueva carpeta Source con el contenido del snapshot.
+// 4) Agrega un tag en el snapshot con una nota de RESTORE y el diff vs versión anterior.
 func restoreSnapshot(job Job, resticPath, snapshotID string, passwordOverride string) (string, error) {
 	if snapshotID == "" {
 		return "", errors.New("snapshot ID must be provided")
 	}
+
+	// Determinamos la contraseña efectiva para restic.
 	pwd := effectivePassword(job)
 	if strings.TrimSpace(pwd) == "" && strings.TrimSpace(passwordOverride) != "" {
 		pwd = passwordOverride
 	}
 
+	// Carpeta temporal donde se hace el restore crudo de restic.
 	restoreRoot := filepath.Join(job.Destination, "restores")
-	target := filepath.Join(restoreRoot, "restore_"+snapshotID)
-	if err := os.MkdirAll(target, 0755); err != nil {
+	if err := os.MkdirAll(restoreRoot, 0755); err != nil {
 		return "", err
 	}
+	tmpTarget := filepath.Join(restoreRoot, "restore_tmp_"+snapshotID)
+
+	// Aseguramos que la carpeta temporal esté vacía.
+	if err := os.RemoveAll(tmpTarget); err != nil {
+		return "", err
+	}
+	if err := os.MkdirAll(tmpTarget, 0755); err != nil {
+		return "", err
+	}
+
+	// Ejecutamos "restic restore <id> --target <tmpTarget>".
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+
 	args := []string{"-r", job.Destination}
 	if strings.TrimSpace(pwd) == "" {
 		args = append(args, "--insecure-no-password")
 	}
-	args = append(args, "restore", snapshotID, "--target", target)
-	_, err := runRestic(ctx, resticPath, pwd, args...)
-	if err != nil {
+	args = append(args, "restore", snapshotID, "--target", tmpTarget)
+
+	if _, err := runRestic(ctx, resticPath, pwd, args...); err != nil {
 		return "", fmt.Errorf("restore failed: %w", err)
 	}
-	return target, nil
+
+	// Obtenemos los archivos del snapshot para conocer sus paths absolutos.
+	nodes, err := listNodes(job, resticPath, snapshotID)
+	if err != nil {
+		return "", fmt.Errorf("could not list snapshot nodes for restore: %w", err)
+	}
+
+	// Mapa path-relativo (respecto a Source) -> path absoluto (formato restic).
+	snapshotFiles := make(map[string]string)
+	for _, n := range nodes {
+		rel := toRelative(job.Source, n.Path)
+		if rel == "" || rel == "." {
+			// No esperamos "." para archivos, pero por seguridad lo ignoramos.
+			continue
+		}
+		snapshotFiles[rel] = n.Path
+	}
+
+	// Back up de la carpeta Source actual: la renombramos antes de pisarla.
+	backupSuffix := time.Now().Format("20060102150405")
+	backupSource := job.Source + ".before-restore-" + backupSuffix
+
+	if fi, err := os.Stat(job.Source); err == nil && fi.IsDir() {
+		// Si existe la carpeta Source, la movemos a <Source>.before-restore-YYYYMMDDHHMMSS
+		if err := os.Rename(job.Source, backupSource); err != nil {
+			return "", fmt.Errorf("could not backup current source folder: %w", err)
+		}
+	} else if err != nil && !os.IsNotExist(err) {
+		// Error real distinto de "no existe"
+		return "", fmt.Errorf("could not stat source folder: %w", err)
+	}
+
+	// Creamos la nueva carpeta Source vacía.
+	if err := os.MkdirAll(job.Source, 0755); err != nil {
+		return "", fmt.Errorf("could not create source folder for restore: %w", err)
+	}
+
+	// Copiamos el contenido restaurado del snapshot dentro de la nueva Source.
+	if err := copySnapshotToSource(tmpTarget, job.Source, snapshotFiles); err != nil {
+		return "", err
+	}
+
+	// Eliminamos la carpeta temporal (best-effort).
+	_ = os.RemoveAll(tmpTarget)
+
+	// Agregamos una nota en los Tags del snapshot con info del restore y el diff.
+	if err := appendRestoreTag(job, resticPath, snapshotID); err != nil && enableLogs {
+		logPrintf("appendRestoreTag failed for job=%s snapshot=%s: %v", job.Name, snapshotID, err)
+	}
+
+	return job.Source, nil
+}
+
+// copySnapshotToSource copia todos los archivos del snapshot (ya restaurados por restic
+// dentro de tmpRoot) a destRoot, respetando la estructura relativa y sobrescribiendo
+// archivos si existen.
+func copySnapshotToSource(tmpRoot, destRoot string, snapshotFiles map[string]string) error {
+	for rel, absSnapshotPath := range snapshotFiles {
+		// restic restaura usando el path "restic" sin el "/" inicial como
+		// subcarpetas dentro de tmpRoot.
+		relUnderTarget := strings.TrimPrefix(filepath.ToSlash(absSnapshotPath), "/")
+		srcPath := filepath.Join(tmpRoot, filepath.FromSlash(relUnderTarget))
+		dstPath := filepath.Join(destRoot, filepath.FromSlash(rel))
+
+		// Aseguramos directorio destino.
+		if err := os.MkdirAll(filepath.Dir(dstPath), 0755); err != nil {
+			return err
+		}
+		if err := copyFile(srcPath, dstPath); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// copyFile copia el contenido de src a dst (creando o sobrescribiendo dst).
+func copyFile(src, dst string) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+
+	out, err := os.Create(dst)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = out.Close() }()
+
+	if _, err := io.Copy(out, in); err != nil {
+		return err
+	}
+	return nil
+}
+
+// appendRestoreTag agrega un tag al snapshot con una nota de RESTORE y, si hay
+// información disponible en el diff cache, incluye el Δ (+, ≠, -) vs la versión anterior.
+func appendRestoreTag(job Job, resticPath, snapshotID string) error {
+	// Construimos la nota con fecha/hora y, si es posible, el resumen de diff.
+	var note string
+	if added, modified, deleted, ok := diffSummary(job, snapshotID); ok {
+		note = fmt.Sprintf(
+			"RESTORE %s (+%d ≠%d -%d vs prev)",
+			time.Now().Format("2006-01-02 15:04:05"),
+			added, modified, deleted,
+		)
+	} else {
+		note = fmt.Sprintf("RESTORE %s", time.Now().Format("2006-01-02 15:04:05"))
+	}
+
+	pwd := effectivePassword(job)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
+	args := []string{"-r", job.Destination}
+	if strings.TrimSpace(pwd) == "" {
+		args = append(args, "--insecure-no-password")
+	}
+	// Usamos "restic tag --add <nota> <snapshotID>" para que aparezca en la columna Tags.
+	args = append(args, "tag", "--add", note, snapshotID)
+
+	if _, err := runRestic(ctx, resticPath, pwd, args...); err != nil {
+		return fmt.Errorf("restic tag failed: %w", err)
+	}
+	return nil
 }
