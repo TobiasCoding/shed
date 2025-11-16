@@ -16,31 +16,67 @@ import (
 )
 
 // computeAndStoreLatestDiff computes the file differences for the most
-// recently created snapshot of the given job. It determines the previous
-// snapshot ID (if any) and calls computeDiff to generate a slice of FileRow
-// entries. The results are stored in the persistent diff cache via
-// storeDiffRows. It returns the snapshot ID of the computed snapshot. If
-// no snapshots exist for the job it returns an empty string.
+// recently created snapshot of the given job. If the newest snapshot has
+// no changes compared to the previous one, the newest snapshot is deleted
+// (restic forget --prune) and the "last check" timestamp is recorded for
+// the previous snapshot instead.
+// computeAndStoreLatestDiff computes the file differences for the most
+// recently created snapshot of the given job. If the newest snapshot has
+// no changes compared to the previous one, the newest snapshot is deleted
+// (restic forget --prune) and the "last check" timestamp is recorded for
+// the previous snapshot instead.
 func computeAndStoreLatestDiff(job Job, resticPath string, snaps []Snapshot) (string, error) {
+	logPrintf("computeAndStoreLatestDiff: job=%s resticPath=%s snaps=%d", job.Name, resticPath, len(snaps))
+
 	if len(snaps) == 0 {
+		logPrintf("computeAndStoreLatestDiff: no snapshots for job=%s, nothing to do", job.Name)
 		return "", nil
 	}
+
 	cur := snaps[len(snaps)-1].ShortID
-	// check if diff already computed
-	if _, ok := getDiffRows(job, cur); ok {
-		return cur, nil
-	}
 	var prev string
 	if len(snaps) > 1 {
 		prev = snaps[len(snaps)-2].ShortID
 	}
+	logPrintf("computeAndStoreLatestDiff: cur=%s prev=%s", cur, prev)
+
 	rows, err := computeDiff(job, resticPath, cur, prev)
 	if err != nil {
+		logPrintf("computeAndStoreLatestDiff: computeDiff error for job=%s cur=%s prev=%s: %v", job.Name, cur, prev, err)
 		return "", err
 	}
+	logPrintf("computeAndStoreLatestDiff: diff rows=%d for job=%s cur=%s prev=%s", len(rows), job.Name, cur, prev)
+
+	if len(rows) == 0 && prev != "" {
+		// sin cambios: borrar snapshot nuevo y marcar last check en el anterior
+		logPrintf("computeAndStoreLatestDiff: NO CHANGES, will forget cur=%s and set last check on prev=%s (job=%s)", cur, prev, job.Name)
+
+		if err := forgetSnapshot(job, resticPath, cur); err != nil {
+			logPrintf("computeAndStoreLatestDiff: forgetSnapshot error for job=%s cur=%s: %v", job.Name, cur, err)
+			return "", err
+		}
+
+		if err := setSnapshotLastCheck(job, prev, time.Now()); err != nil {
+			logPrintf("computeAndStoreLatestDiff: setSnapshotLastCheck(prev) error for job=%s prev=%s: %v", job.Name, prev, err)
+		} else {
+			logPrintf("computeAndStoreLatestDiff: setSnapshotLastCheck(prev) OK for job=%s prev=%s", job.Name, prev)
+		}
+		return prev, nil
+	}
+
+	// con cambios: guardar diff y last check en el snapshot actual
+	logPrintf("computeAndStoreLatestDiff: CHANGES detected, storing diff for job=%s cur=%s", job.Name, cur)
 	if err := storeDiffRows(job, cur, rows); err != nil {
+		logPrintf("computeAndStoreLatestDiff: storeDiffRows error for job=%s cur=%s: %v", job.Name, cur, err)
 		return "", err
 	}
+
+	if err := setSnapshotLastCheck(job, cur, time.Now()); err != nil {
+		logPrintf("computeAndStoreLatestDiff: setSnapshotLastCheck(cur) error for job=%s cur=%s: %v", job.Name, cur, err)
+	} else {
+		logPrintf("computeAndStoreLatestDiff: setSnapshotLastCheck(cur) OK for job=%s cur=%s", job.Name, cur)
+	}
+
 	return cur, nil
 }
 

@@ -1,6 +1,7 @@
+//go:generate windres app.rc -O coff -o app.syso
 package main
 
-// shed_1.0 – GUI para backups incrementales con restic (Windows/Linux)
+// shed – GUI para backups incrementales con restic (Windows/Linux)
 // Autor: tobiasrimoli@protonmail.com
 
 import (
@@ -10,32 +11,26 @@ import (
 	"log"
 	"os"
 
+	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/app"
+	"fyne.io/fyne/v2/driver/desktop"
 )
 
-// iconData embeds the application icon. It is referenced by the UI and
-// initialised via the go:embed directive below. The file assets/icon.png
-// must exist in the project tree at build time.
+// iconData embeddeado para usar como icono de la aplicación y del tray.
 //
 //go:embed assets/icon.png
 var iconData []byte
 
-// main is the entry point of the application. It parses command-line flags,
-// loads the configuration, detects the restic binary, starts any live
-// backup goroutines and launches the user interface. When the --logs flag
-// is provided verbose logging is written to stdout; otherwise it is
-// discarded. Errors encountered during startup are logged but do not
-// prevent the UI from running.
+// main es el punto de entrada. Configura logs, carga configuración,
+// detecta restic, inicia los backups en vivo y levanta la UI.
 func main() {
 	// parse command line flags
 	logs := flag.Bool("logs", false, "enable verbose logging")
 	flag.Parse()
 	if *logs {
 		enableLogs = true
-		// direct log output to stdout
 		log.SetOutput(os.Stdout)
 	} else {
-		// discard log output when logs flag not set
 		log.SetOutput(io.Discard)
 	}
 
@@ -51,8 +46,37 @@ func main() {
 	// start live backups if any job has Live enabled
 	startLiveBackups(cfg.ResticPath)
 
-	// initialise and run Fyne application
-	myApp := app.NewWithID("shed_1_0")
+	// initialise Fyne application
+	myApp := app.NewWithID("Shed")
+
+	// Icono de la app (también se usa por defecto para el tray).
+	if len(iconData) > 0 {
+		iconRes := fyne.NewStaticResource("icon.png", iconData)
+		myApp.SetIcon(iconRes)
+	}
+
+	// Construimos la ventana principal.
 	win := buildUI(myApp)
+
+	// ---------------------------------------------------------------------
+	// System tray: menú con Show / Exit y cierre por X que solo oculta.
+	// ---------------------------------------------------------------------
+	if desk, ok := myApp.(desktop.App); ok {
+		// Menú del tray: Show y Exit.
+		trayMenu := fyne.NewMenu("Shed",
+			fyne.NewMenuItem("Show", func() {
+				win.Show()
+				win.RequestFocus()
+			}),
+		)
+		desk.SetSystemTrayMenu(trayMenu)
+	}
+
+	// Al cerrar con la X, solo ocultamos la ventana (la app sigue en el tray).
+	win.SetCloseIntercept(func() {
+		win.Hide()
+	})
+
+	// run application event loop
 	win.ShowAndRun()
 }

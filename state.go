@@ -30,12 +30,19 @@ var (
 )
 
 // Snapshot filtering and selection
+// Snapshot filtering and selection
 var (
 	allSnapshots    []Snapshot
 	filterSnapQuery string
 	filterSnapshots []Snapshot
 	snapTable       *widget.Table
 	selectedSnapIdx = -1
+
+	// Estado de UI: si estamos recalculando el Last check para un job,
+	// mostramos un spinner en la columna correspondiente.
+	lastCheckUpdatingJob string
+	lastCheckUpdating    bool
+	lastCheckUpdatingMu  sync.Mutex
 )
 
 // File diff filtering and selection
@@ -133,6 +140,59 @@ func effectivePassword(job Job) string {
 // -----------------------------------------------------------------------------
 // UI helpers
 // -----------------------------------------------------------------------------
+
+// notifyLastCheckChanged se llama cada vez que se persiste un nuevo "Last check"
+// para un snapshot. Refresca la tabla de snapshots en el hilo principal para que
+// la columna "Last check" se actualice sin tener que reiniciar la aplicación.
+func notifyLastCheckChanged(job Job, snapshotID string) {
+	if snapTable == nil {
+		return
+	}
+	if selectedJobIndex < 0 || selectedJobIndex >= len(cfg.Jobs) {
+		return
+	}
+	if cfg.Jobs[selectedJobIndex].Name != job.Name {
+		return
+	}
+	// Ejecución desde la goroutine de fondo:
+	// Usamos un canal o un simple go-call para pasar al hilo principal,
+	// si es que Fyne lo requiere. Pero Fyne documenta que muchos métodos
+	// son seguros para usar desde go-rutinas. :contentReference[oaicite:2]{index=2}
+	go func() {
+		snapTable.Refresh()
+	}()
+}
+
+// logPrintf prints to the standard logger when enableLogs is true. It is used
+// instead of direct log.Printf calls throughout the application.
+// setLastCheckUpdating marca un job como "actualizando Last check" para la UI.
+func setLastCheckUpdating(jobName string, updating bool) {
+	lastCheckUpdatingMu.Lock()
+	defer lastCheckUpdatingMu.Unlock()
+
+	if updating {
+		lastCheckUpdatingJob = jobName
+		lastCheckUpdating = true
+		if enableLogs {
+			logPrintf("UI: Last check updating started for job=%s", jobName)
+		}
+	} else {
+		if lastCheckUpdatingJob == jobName {
+			lastCheckUpdating = false
+			lastCheckUpdatingJob = ""
+			if enableLogs {
+				logPrintf("UI: Last check updating finished for job=%s", jobName)
+			}
+		}
+	}
+}
+
+// isLastCheckUpdating devuelve true si la UI debe mostrar el spinner para ese job.
+func isLastCheckUpdating(jobName string) bool {
+	lastCheckUpdatingMu.Lock()
+	defer lastCheckUpdatingMu.Unlock()
+	return lastCheckUpdating && lastCheckUpdatingJob == jobName
+}
 
 // setStatus updates the status label text. It acquires a mutex to avoid
 // concurrent updates. If the statusLabel is nil (UI not yet initialised)

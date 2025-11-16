@@ -109,9 +109,9 @@ func measureTextWidth(s string) float32 {
 // without truncation where possible. The result can be stored in Config and
 // reused on future runs.
 func autoSnapshotColumnWidths() []float32 {
-	const snapCols = 7
+	const snapCols = 8
 	widths := make([]float32, snapCols)
-	headers := []string{"ID", "Date", "Time", "Host", "#Paths", "Δ", "Tags"}
+	headers := []string{"ID", "Date", "Time", "Host", "#Paths", "Δ", "Tags", "Last check"}
 	for i, h := range headers {
 		w := measureTextWidth(h)
 		if w > widths[i] {
@@ -127,6 +127,7 @@ func autoSnapshotColumnWidths() []float32 {
 			strconv.Itoa(len(s.Paths)),
 			"", // Δ (no usamos datos reales acá)
 			strings.Join(s.Tags, ","),
+			"", // Last check (vacío la primera vez)
 		}
 		for i, v := range values {
 			w := measureTextWidth(v)
@@ -136,7 +137,7 @@ func autoSnapshotColumnWidths() []float32 {
 		}
 	}
 	// mínimos / máximos razonables
-	min := []float32{80, 80, 70, 120, 60, 60, 120}
+	min := []float32{80, 80, 70, 120, 60, 60, 120, 140}
 	const maxWidth float32 = 700
 	for i := range widths {
 		if widths[i] < min[i] {
@@ -199,24 +200,14 @@ func applySnapshotColumnWidths() {
 	if snapTable == nil {
 		return
 	}
-	const snapCols = 7
 
+	const snapCols = 8
+
+	// Si el config no tiene exactamente 8 columnas, usamos los defaults
 	widths := cfg.SnapColWidths
-
-	// Migración: configs viejos tenían 6 columnas (sin Δ).
-	if len(widths) == 6 {
-		migrated := make([]float32, 7)
-		// ID, Date, Time, Host, #Paths
-		copy(migrated, widths[:5])
-		// Δ por defecto
-		migrated[5] = 80
-		// Tags (antes col 5)
-		migrated[6] = widths[5]
-		widths = migrated
-		cfg.SnapColWidths = migrated
-	} else if len(widths) != snapCols {
-		// fallback a los valores fijos originales (incluyendo Δ)
-		widths = []float32{110, 90, 85, 160, 70, 80, 220}
+	if len(widths) != snapCols {
+		// ID, Date, Time, Host, #Paths, Δ, Tags, Last check
+		widths = []float32{110, 90, 85, 160, 70, 80, 220, 170}
 	}
 
 	for col, w := range widths {
@@ -231,7 +222,7 @@ func applySnapshotColumnWidths() {
 // An about button is placed at the top right. Status messages are displayed
 // in a bar at the bottom of the window.
 func buildUI(myApp fyne.App) fyne.Window {
-	win := myApp.NewWindow("shed")
+	win := myApp.NewWindow("Shed")
 	if len(iconData) > 0 {
 		win.SetIcon(fyne.NewStaticResource("icon.png", iconData))
 	}
@@ -239,7 +230,7 @@ func buildUI(myApp fyne.App) fyne.Window {
 
 	// about button anchored to top right
 	aboutBtn := widget.NewButton("About", func() {
-		dialog.ShowInformation("About", "shed v1.0\nDeveloper: tobiasrimoli@protonmail.com", win)
+		dialog.ShowInformation("About", "Shed v1.0\nDeveloper: tobiasrimoli@protonmail.com", win)
 	})
 
 	statusLabel = widget.NewLabel("Ready")
@@ -324,11 +315,11 @@ func buildUI(myApp fyne.App) fyne.Window {
 	snapSearchRow := container.NewBorder(nil, nil, nil, snapSearchBtn, snapSearch)
 	rebuildSnapFilter("")
 
-	// Tabla de snapshots con columna Δ de resumen de cambios
+	// Tabla de snapshots con columna Δ (resumen de cambios) y columna Last check
 	snapTable = widget.NewTable(
-		func() (int, int) { return len(filterSnapshots), 7 }, // 7 columnas: ID, Date, Time, Host, #Paths, Δ, Tags
+		func() (int, int) { return len(filterSnapshots), 8 }, // 8 columnas: ID, Date, Time, Host, #Paths, Δ, Tags, Last check
 		func() fyne.CanvasObject {
-			// plantilla: tres textos horizontales, para poder colorear la columna Δ
+			// plantilla: tres textos horizontales, para Δ (coloreable) o texto simple
 			t1 := canvas.NewText("", theme.ForegroundColor())
 			t2 := canvas.NewText("", theme.ForegroundColor())
 			t3 := canvas.NewText("", theme.ForegroundColor())
@@ -393,11 +384,36 @@ func buildUI(myApp fyne.App) fyne.Window {
 				}
 			case 6:
 				t1.Text = strings.Join(s.Tags, ",")
+			case 7:
+				// Last check: dd/mm/aaaa hh:mm:ss
+				if selectedJobIndex < 0 || selectedJobIndex >= len(cfg.Jobs) {
+					return
+				}
+				job := cfg.Jobs[selectedJobIndex]
+
+				// Si estamos actualizando el Last check para este job,
+				// mostramos un "spinner" textual en vez de la fecha.
+				if isLastCheckUpdating(job.Name) {
+					t1.Text = "⏳ Actualizando…"
+					t2.Text = ""
+					t3.Text = ""
+					return
+				}
+
+				if ts, ok := getSnapshotLastCheck(job, s.ShortID); ok {
+					t1.Text = ts.Format("02/01/2006 15:04:05")
+					t2.Text = ""
+					t3.Text = ""
+				}
 			}
 		},
 	)
 
 	// usar fila de header nativa de Table para permitir resize por drag
+	snapTable.ShowHeaderRow = true
+	snapTable.CreateHeader = func() fyne.CanvasObject {
+		return widget.NewLabel("")
+	}
 	snapTable.ShowHeaderRow = true
 	snapTable.CreateHeader = func() fyne.CanvasObject {
 		return widget.NewLabel("")
@@ -422,6 +438,8 @@ func buildUI(myApp fyne.App) fyne.Window {
 				l.SetText("Δ")
 			case 6:
 				l.SetText("Tags")
+			case 7:
+				l.SetText("Last check")
 			default:
 				l.SetText("")
 			}
@@ -429,6 +447,7 @@ func buildUI(myApp fyne.App) fyne.Window {
 			l.SetText("")
 		}
 	}
+
 	applySnapshotColumnWidths()
 
 	// ---- Files panel
@@ -712,12 +731,13 @@ func buildUI(myApp fyne.App) fyne.Window {
 			changed := false
 
 			if snapTable != nil {
-				newW := grabTableColumnWidths(snapTable, 7, cfg.SnapColWidths)
+				newW := grabTableColumnWidths(snapTable, 8, cfg.SnapColWidths)
 				if !float32SlicesEqual(newW, cfg.SnapColWidths) {
 					cfg.SnapColWidths = newW
 					changed = true
 				}
 			}
+
 			if filesTable != nil {
 				newW := grabTableColumnWidths(filesTable, 5, cfg.FileColWidths)
 				if !float32SlicesEqual(newW, cfg.FileColWidths) {
@@ -737,7 +757,7 @@ func buildUI(myApp fyne.App) fyne.Window {
 	// al cerrar la ventana guardamos los anchos actuales de las columnas (último flush)
 	win.SetOnClosed(func() {
 		if snapTable != nil {
-			cfg.SnapColWidths = grabTableColumnWidths(snapTable, 7, cfg.SnapColWidths)
+			cfg.SnapColWidths = grabTableColumnWidths(snapTable, 8, cfg.SnapColWidths)
 		}
 		if filesTable != nil {
 			cfg.FileColWidths = grabTableColumnWidths(filesTable, 5, cfg.FileColWidths)
@@ -760,10 +780,14 @@ func runBackupWithPassword(job Job, password string) {
 	prog := dialog.NewProgress("Backup in progress", fmt.Sprintf("Backing up %s…", job.Name), w)
 	prog.SetValue(0)
 	prog.Show()
+
 	go func() {
 		t := time.NewTicker(500 * time.Millisecond)
 		defer t.Stop()
+
 		done := make(chan error, 1)
+
+		// goroutine que ejecuta el backup real
 		go func() {
 			err := doBackup(job, cfg.ResticPath, password, func(msg string) {
 				if enableLogs {
@@ -772,39 +796,85 @@ func runBackupWithPassword(job Job, password string) {
 			})
 			done <- err
 		}()
+
 		val := 0.0
+
 		for {
 			select {
 			case err := <-done:
+				// terminó el backup
 				prog.SetValue(1.0)
 				prog.Hide()
+
 				if err != nil {
+					// backup falló
 					dialog.ShowError(err, w)
 				} else {
+					// backup OK
 					fyne.CurrentApp().SendNotification(&fyne.Notification{
 						Title:   "Backup completed",
 						Content: fmt.Sprintf("Backup for %s finished.", job.Name),
 					})
-					// refresh snapshots
-					go func() {
-						snaps, e := listSnapshots(job, cfg.ResticPath)
-						if e == nil {
-							allSnapshots = snaps
-							rebuildSnapFilter("")
+
+					// mostrar spinner de "Last check" mientras se recalcula
+					setLastCheckUpdating(job.Name, true)
+					if snapTable != nil {
+						snapTable.Refresh()
+					}
+
+					// refrescar snapshots y last-check en segundo plano
+					go func(j Job) {
+						defer func() {
+							// apagar spinner y refrescar la tabla cuando terminamos
+							setLastCheckUpdating(j.Name, false)
 							if snapTable != nil {
 								snapTable.Refresh()
 							}
-							// compute diff for newest snapshot
-							if _, err2 := computeAndStoreLatestDiff(job, cfg.ResticPath, snaps); err2 != nil {
+						}()
+
+						// 1) leer snapshots luego del backup
+						snaps, e := listSnapshots(j, cfg.ResticPath)
+						if e != nil {
+							if enableLogs {
+								logPrintf("listSnapshots after backup failed: %v", e)
+							}
+							return
+						}
+
+						// 2) calcular diff del último snapshot (puede borrar el último
+						//    si no hay cambios y actualizar "Last check")
+						if _, err2 := computeAndStoreLatestDiff(j, cfg.ResticPath, snaps); err2 != nil {
+							if enableLogs {
 								logPrintf("diff computation failed: %v", err2)
 							}
 						}
-					}()
+
+						// 3) volver a leer snapshots porque computeAndStoreLatestDiff
+						//    puede haber eliminado el snapshot más nuevo
+						snaps, e = listSnapshots(j, cfg.ResticPath)
+						if e != nil {
+							if enableLogs {
+								logPrintf("listSnapshots after diff failed: %v", e)
+							}
+							return
+						}
+
+						// 4) actualizar la UI con la lista real y el Last check recién escrito
+						allSnapshots = snaps
+						// respetar el filtro actual de snapshots
+						rebuildSnapFilter(filterSnapQuery)
+						if snapTable != nil {
+							snapTable.Refresh()
+						}
+					}(job)
 				}
+
 				// update live backups (in case retention settings changed)
 				startLiveBackups(cfg.ResticPath)
 				return
+
 			case <-t.C:
+				// animación de progreso mientras corre el backup
 				val += 0.02
 				if val > 0.95 {
 					val = 0.95
@@ -1048,11 +1118,15 @@ func showJobEditor(parent fyne.Window, index int, jl *widget.List) {
 func showSettings(parent fyne.Window) {
 	resticEntry := widget.NewEntry()
 	resticEntry.SetText(cfg.ResticPath)
+
+	// Checkbox que controla si shed se registra o no para iniciar con el sistema.
 	autoStartCheck := widget.NewCheck("Launch on startup", func(bool) {})
 	autoStartCheck.SetChecked(cfg.AutoStart)
+
 	browse := widget.NewButton("Browse", func() {
 		openFileDialog("Select restic executable", func(p string) { resticEntry.SetText(p) })
 	})
+
 	var w fyne.Window
 	form := &widget.Form{
 		Items: []*widget.FormItem{
@@ -1060,6 +1134,7 @@ func showSettings(parent fyne.Window) {
 			{Text: "Autostart", Widget: autoStartCheck},
 		},
 		OnSubmit: func() {
+			// Validación de la ruta de restic.
 			p := strings.TrimSpace(resticEntry.Text)
 			if p == "" {
 				dialog.ShowError(errors.New("select restic executable"), w)
@@ -1074,18 +1149,27 @@ func showSettings(parent fyne.Window) {
 				dialog.ShowError(errors.New("invalid restic path"), w)
 				return
 			}
+
+			// Persistimos configuración.
 			cfg.ResticPath = abs
 			cfg.AutoStart = autoStartCheck.Checked
 			if err := saveConfig(cfg); err != nil {
 				dialog.ShowError(err, w)
 				return
 			}
+
+			// Según el estado del checkbox, instalamos o eliminamos autostart.
 			if cfg.AutoStart {
 				if err := installAutostart(); err != nil && enableLogs {
 					logPrintf("autostart install failed: %v", err)
 				}
+			} else {
+				if err := uninstallAutostart(); err != nil && enableLogs {
+					logPrintf("autostart uninstall failed: %v", err)
+				}
 			}
-			// restart live backups with new restic path
+
+			// Reiniciamos live backups con la nueva ruta de restic.
 			startLiveBackups(cfg.ResticPath)
 			w.Close()
 		},
@@ -1093,6 +1177,7 @@ func showSettings(parent fyne.Window) {
 	}
 	form.SubmitText = "Save"
 	form.CancelText = "Cancel"
+
 	w = fyne.CurrentApp().NewWindow("Settings")
 	w.SetContent(container.NewVScroll(form))
 	w.Resize(fyne.NewSize(560, 220))

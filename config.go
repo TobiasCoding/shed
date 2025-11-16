@@ -26,14 +26,14 @@ func defaultConfig() *Config {
 
 // configDir returns the application configuration directory. It uses
 // os.UserConfigDir to determine a per-user directory and creates the
-// subdirectory "shed_1_0" inside it. If the user configuration directory
+// subdirectory "Shed" inside it. If the user configuration directory
 // cannot be determined the current working directory is used instead.
 func configDir() string {
 	dir, err := os.UserConfigDir()
 	if err != nil {
 		dir = "."
 	}
-	appDir := filepath.Join(dir, "shed_1_0")
+	appDir := filepath.Join(dir, "Shed")
 	_ = os.MkdirAll(appDir, 0755)
 	return appDir
 }

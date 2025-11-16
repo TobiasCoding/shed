@@ -1,4 +1,4 @@
-module shed_1.0
+module shed
 
 go 1.20
 

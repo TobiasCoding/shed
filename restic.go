@@ -190,6 +190,31 @@ func doBackup(job Job, resticPath string, passwordOverride string, progress func
 	return nil
 }
 
+// forgetSnapshot deletes a single snapshot from the repository using
+// "restic forget <id> --prune". It uses the job's effective password.
+func forgetSnapshot(job Job, resticPath, snapshotID string) error {
+	if strings.TrimSpace(snapshotID) == "" {
+		return errors.New("snapshot ID must be provided")
+	}
+
+	pwd := effectivePassword(job)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	defer cancel()
+
+	args := []string{"-r", job.Destination}
+	if strings.TrimSpace(pwd) == "" {
+		args = append(args, "--insecure-no-password")
+	}
+	args = append(args, "forget", snapshotID, "--prune")
+
+	out, err := runRestic(ctx, resticPath, pwd, args...)
+	if err != nil {
+		return fmt.Errorf("restic forget failed: %w (out=%s)", err, string(out))
+	}
+	return nil
+}
+
 // listSnapshots retrieves the list of snapshots for a job from the repository.
 // The returned slice is sorted by time in ascending order. If el repositorio
 // todavía no existe, devuelve una lista vacía sin crear nada.

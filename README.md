@@ -3,14 +3,14 @@
 ### **Version 1.0.0**
 
 <p align="center">
-  <img src="assets/icon.png" alt="shed icon" width="140">
+  <img src="assets/icon.png" alt="Shed icon" width="140">
 </p>
 
 ---
 
 ## **Overview**
 
-*shed* is a cross-platform backup manager built in Go, featuring Restic integration, BitLocker unlock support, real-time file diffing, snapshot navigation, and a modern Fyne-based UI.
+*Shed* is a cross-platform backup manager built in Go, featuring Restic integration, BitLocker unlock support, real-time file diffing, snapshot navigation, and a modern Fyne-based UI.
 
 ---
 
@@ -74,7 +74,7 @@ go build -o shed
 On Windows:
 
 ```sh
-go build -o shed.exe
+go build -ldflags "-H=windowsgui" -o shed.exe .
 ```
 
 The resulting binary will appear in the current directory.
