@@ -3,6 +3,7 @@ package main
 import (
 	"errors"
 	"fmt"
+	"image/color"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -10,6 +11,7 @@ import (
 	"time"
 
 	"fyne.io/fyne/v2"
+	"fyne.io/fyne/v2/canvas"
 	"fyne.io/fyne/v2/container"
 	"fyne.io/fyne/v2/dialog"
 	"fyne.io/fyne/v2/theme"
@@ -107,9 +109,9 @@ func measureTextWidth(s string) float32 {
 // without truncation where possible. The result can be stored in Config and
 // reused on future runs.
 func autoSnapshotColumnWidths() []float32 {
-	const snapCols = 6
+	const snapCols = 7
 	widths := make([]float32, snapCols)
-	headers := []string{"ID", "Date", "Time", "Host", "#Paths", "Tags"}
+	headers := []string{"ID", "Date", "Time", "Host", "#Paths", "Δ", "Tags"}
 	for i, h := range headers {
 		w := measureTextWidth(h)
 		if w > widths[i] {
@@ -123,6 +125,7 @@ func autoSnapshotColumnWidths() []float32 {
 			s.Time.Format("15:04:05"),
 			s.Hostname,
 			strconv.Itoa(len(s.Paths)),
+			"", // Δ (no usamos datos reales acá)
 			strings.Join(s.Tags, ","),
 		}
 		for i, v := range values {
@@ -133,7 +136,7 @@ func autoSnapshotColumnWidths() []float32 {
 		}
 	}
 	// mínimos / máximos razonables
-	min := []float32{80, 80, 70, 120, 60, 120}
+	min := []float32{80, 80, 70, 120, 60, 60, 120}
 	const maxWidth float32 = 700
 	for i := range widths {
 		if widths[i] < min[i] {
@@ -196,12 +199,26 @@ func applySnapshotColumnWidths() {
 	if snapTable == nil {
 		return
 	}
-	const snapCols = 6
+	const snapCols = 7
+
 	widths := cfg.SnapColWidths
-	if len(widths) != snapCols {
-		// fallback a los valores fijos originales
-		widths = []float32{110, 90, 85, 160, 70, 250}
+
+	// Migración: configs viejos tenían 6 columnas (sin Δ).
+	if len(widths) == 6 {
+		migrated := make([]float32, 7)
+		// ID, Date, Time, Host, #Paths
+		copy(migrated, widths[:5])
+		// Δ por defecto
+		migrated[5] = 80
+		// Tags (antes col 5)
+		migrated[6] = widths[5]
+		widths = migrated
+		cfg.SnapColWidths = migrated
+	} else if len(widths) != snapCols {
+		// fallback a los valores fijos originales (incluyendo Δ)
+		widths = []float32{110, 90, 85, 160, 70, 80, 220}
 	}
+
 	for col, w := range widths {
 		snapTable.SetColumnWidth(col, w)
 	}
@@ -306,36 +323,80 @@ func buildUI(myApp fyne.App) fyne.Window {
 	snapSearchBtn := widget.NewButtonWithIcon("", theme.SearchIcon(), func() {})
 	snapSearchRow := container.NewBorder(nil, nil, nil, snapSearchBtn, snapSearch)
 	rebuildSnapFilter("")
+
+	// Tabla de snapshots con columna Δ de resumen de cambios
 	snapTable = widget.NewTable(
-		func() (int, int) { return len(filterSnapshots), 6 },
-		func() fyne.CanvasObject { return widget.NewLabel("") },
+		func() (int, int) { return len(filterSnapshots), 7 }, // 7 columnas: ID, Date, Time, Host, #Paths, Δ, Tags
+		func() fyne.CanvasObject {
+			// plantilla: tres textos horizontales, para poder colorear la columna Δ
+			t1 := canvas.NewText("", theme.ForegroundColor())
+			t2 := canvas.NewText("", theme.ForegroundColor())
+			t3 := canvas.NewText("", theme.ForegroundColor())
+			ts := theme.TextSize()
+			t1.TextSize = ts
+			t2.TextSize = ts
+			t3.TextSize = ts
+			return container.NewHBox(t1, t2, t3)
+		},
 		func(id widget.TableCellID, o fyne.CanvasObject) {
-			l := o.(*widget.Label)
-			l.Wrapping = fyne.TextTruncate
+			c := o.(*fyne.Container)
+			t1 := c.Objects[0].(*canvas.Text)
+			t2 := c.Objects[1].(*canvas.Text)
+			t3 := c.Objects[2].(*canvas.Text)
+
+			// reset básico
+			fg := theme.ForegroundColor()
+			t1.Color, t2.Color, t3.Color = fg, fg, fg
+			t1.Text, t2.Text, t3.Text = "", "", ""
+
 			row := id.Row
 			if row < 0 || row >= len(filterSnapshots) {
-				l.SetText("")
 				return
 			}
 			s := filterSnapshots[row]
+
 			switch id.Col {
 			case 0:
-				l.SetText(s.ShortID)
+				t1.Text = s.ShortID
 			case 1:
-				l.SetText(s.Time.Format("02/01/2006"))
+				t1.Text = s.Time.Format("02/01/2006")
 			case 2:
-				l.SetText(s.Time.Format("15:04:05"))
+				t1.Text = s.Time.Format("15:04:05")
 			case 3:
-				l.SetText(s.Hostname)
+				t1.Text = s.Hostname
 			case 4:
-				l.SetText(strconv.Itoa(len(s.Paths)))
+				t1.Text = strconv.Itoa(len(s.Paths))
 			case 5:
-				l.SetText(strings.Join(s.Tags, ","))
-			default:
-				l.SetText("")
+				// columna Δ: resumen de cambios en colores
+				if selectedJobIndex < 0 || selectedJobIndex >= len(cfg.Jobs) {
+					return
+				}
+				job := cfg.Jobs[selectedJobIndex]
+				added, modified, deleted, ok := diffSummary(job, s.ShortID)
+				if !ok {
+					// aún no hay diff cacheado para este snapshot
+					return
+				}
+
+				// verde para +, amarillo para ≠, rojo para -
+				if added > 0 {
+					t1.Text = fmt.Sprintf("+%d", added)
+					t1.Color = color.RGBA{0, 200, 0, 255}
+				}
+				if modified > 0 {
+					t2.Text = fmt.Sprintf("≠%d", modified)
+					t2.Color = color.RGBA{220, 180, 0, 255}
+				}
+				if deleted > 0 {
+					t3.Text = fmt.Sprintf("-%d", deleted)
+					t3.Color = color.RGBA{220, 0, 0, 255}
+				}
+			case 6:
+				t1.Text = strings.Join(s.Tags, ",")
 			}
 		},
 	)
+
 	// usar fila de header nativa de Table para permitir resize por drag
 	snapTable.ShowHeaderRow = true
 	snapTable.CreateHeader = func() fyne.CanvasObject {
@@ -358,6 +419,8 @@ func buildUI(myApp fyne.App) fyne.Window {
 			case 4:
 				l.SetText("#Paths")
 			case 5:
+				l.SetText("Δ")
+			case 6:
 				l.SetText("Tags")
 			default:
 				l.SetText("")
@@ -649,7 +712,7 @@ func buildUI(myApp fyne.App) fyne.Window {
 			changed := false
 
 			if snapTable != nil {
-				newW := grabTableColumnWidths(snapTable, 6, cfg.SnapColWidths)
+				newW := grabTableColumnWidths(snapTable, 7, cfg.SnapColWidths)
 				if !float32SlicesEqual(newW, cfg.SnapColWidths) {
 					cfg.SnapColWidths = newW
 					changed = true
@@ -674,7 +737,7 @@ func buildUI(myApp fyne.App) fyne.Window {
 	// al cerrar la ventana guardamos los anchos actuales de las columnas (último flush)
 	win.SetOnClosed(func() {
 		if snapTable != nil {
-			cfg.SnapColWidths = grabTableColumnWidths(snapTable, 6, cfg.SnapColWidths)
+			cfg.SnapColWidths = grabTableColumnWidths(snapTable, 7, cfg.SnapColWidths)
 		}
 		if filesTable != nil {
 			cfg.FileColWidths = grabTableColumnWidths(filesTable, 5, cfg.FileColWidths)
