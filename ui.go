@@ -1,0 +1,995 @@
+package main
+
+import (
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"time"
+
+	"fyne.io/fyne/v2"
+	"fyne.io/fyne/v2/container"
+	"fyne.io/fyne/v2/dialog"
+	"fyne.io/fyne/v2/theme"
+	"fyne.io/fyne/v2/widget"
+)
+
+// promptRepoPassword se asegura de que haya una contraseña disponible para el job.
+// Si ya existe (RepoPassword o cache en memoria), llama directamente a onReady.
+// Si no, muestra un diálogo pidiendo la contraseña, la cachea y luego llama a onReady.
+func promptRepoPassword(job Job, title string, label string, win fyne.Window, onReady func(pw string)) {
+	// Si ya tenemos contraseña en memoria o config
+	if pw := effectivePassword(job); strings.TrimSpace(pw) != "" {
+		onReady(pw)
+		return
+	}
+
+	pwEntry := widget.NewPasswordEntry()
+
+	pwForm := widget.NewForm(
+		&widget.FormItem{Text: label, Widget: pwEntry},
+	)
+
+	// Declarar dlg con el TIPO CORRECTO
+	var dlg *dialog.ConfirmDialog
+
+	// Acción de OK (reutilizable por botón y Enter)
+	okAction := func() {
+		pw := strings.TrimSpace(pwEntry.Text)
+		if pw == "" {
+			dialog.ShowError(errors.New("password cannot be empty"), win)
+			return
+		}
+		setJobPassword(job.Name, pw)
+		dlg.Hide()
+		onReady(pw)
+	}
+
+	// Crear el diálogo
+	dlg = dialog.NewCustomConfirm(
+		title,
+		"OK",
+		"Cancel",
+		pwForm,
+		func(ok bool) {
+			if ok {
+				okAction()
+			}
+		},
+		win,
+	)
+
+	// ENTER = OK
+	pwEntry.OnSubmitted = func(_ string) {
+		okAction()
+	}
+
+	// Agrandar ventana
+	dlg.Resize(fyne.NewSize(500, 220))
+
+	dlg.Show()
+}
+
+// buildUI constructs the entire application user interface. It takes the
+// application instance and returns the main window. The UI is divided into
+// left and right panels. The left panel lists jobs and provides job
+// management actions. The right panel lists snapshots and file differences.
+// An about button is placed at the top right. Status messages are displayed
+// in a bar at the bottom of the window.
+func buildUI(myApp fyne.App) fyne.Window {
+	win := myApp.NewWindow("shed")
+	if len(iconData) > 0 {
+		win.SetIcon(fyne.NewStaticResource("icon.png", iconData))
+	}
+	win.Resize(fyne.NewSize(1200, 700))
+
+	// about button anchored to top right
+	aboutBtn := widget.NewButton("About", func() {
+		dialog.ShowInformation("About", "shed v1.0\nDeveloper: tobiasrimoli@protonmail.com", win)
+	})
+
+	statusLabel = widget.NewLabel("Ready")
+
+	// ---- Jobs panel
+	jobSearch = widget.NewEntry()
+	jobSearch.SetPlaceHolder("Search jobs…")
+	jobSearch.OnChanged = func(s string) {
+		rebuildJobFilter(s)
+		jobList.Refresh()
+	}
+	jobSearchBtn := widget.NewButtonWithIcon("", theme.SearchIcon(), func() {})
+	jobSearchRow := container.NewBorder(nil, nil, nil, jobSearchBtn, jobSearch)
+	rebuildJobFilter("")
+	jobList = widget.NewList(
+		func() int { return len(filterJobIdx) },
+		func() fyne.CanvasObject { return widget.NewLabel("job") },
+		func(i int, o fyne.CanvasObject) {
+			idx := filterJobIdx[i]
+			o.(*widget.Label).SetText(cfg.Jobs[idx].Name)
+		},
+	)
+	selectedJobIndex := -1
+	addBtn := widget.NewButtonWithIcon("Add", theme.ContentAddIcon(), func() {
+		showJobEditor(win, -1, jobList)
+	})
+	editBtn := widget.NewButton("Edit", func() {
+		if selectedJobIndex < 0 || selectedJobIndex >= len(cfg.Jobs) {
+			dialog.ShowInformation("Edit", "Please select a job first.", win)
+			return
+		}
+		showJobEditor(win, selectedJobIndex, jobList)
+	})
+	deleteBtn := widget.NewButton("Delete", func() {
+		if selectedJobIndex < 0 || selectedJobIndex >= len(cfg.Jobs) {
+			dialog.ShowInformation("Delete", "Please select a job first.", win)
+			return
+		}
+		job := cfg.Jobs[selectedJobIndex]
+		dialog.ShowConfirm(
+			"Delete",
+			fmt.Sprintf("Delete %q? Snapshots are NOT deleted from disk.", job.Name),
+			func(ok bool) {
+				if !ok {
+					return
+				}
+				cfg.Jobs = append(cfg.Jobs[:selectedJobIndex], cfg.Jobs[selectedJobIndex+1:]...)
+				if err := saveConfig(cfg); err != nil {
+					dialog.ShowError(err, win)
+					return
+				}
+				rebuildJobFilter(jobSearch.Text)
+				jobList.Refresh()
+				// clear snapshots and files
+				allSnapshots = nil
+				filterSnapshots = nil
+				if snapTable != nil {
+					snapTable.Refresh()
+				}
+				allFiles = nil
+				filterFiles = nil
+				if filesTable != nil {
+					filesTable.Refresh()
+				}
+				selectedJobIndex = -1
+				setStatus("No job selected")
+				// update live backups
+				startLiveBackups(cfg.ResticPath)
+			}, win)
+	})
+	settingsBtn := widget.NewButtonWithIcon("Settings", theme.SettingsIcon(), func() {
+		showSettings(win)
+	})
+	leftTopRow := container.NewHBox(addBtn, editBtn, deleteBtn, settingsBtn)
+	leftTop := container.NewVBox(jobSearchRow, leftTopRow)
+	left := container.NewBorder(nil, nil, nil, nil, container.NewBorder(leftTop, nil, nil, nil, jobList))
+
+	// ---- Snapshots panel
+	snapSearch := widget.NewEntry()
+	snapSearch.SetPlaceHolder("Search snapshots…")
+	snapSearchBtn := widget.NewButtonWithIcon("", theme.SearchIcon(), func() {})
+	snapSearchRow := container.NewBorder(nil, nil, nil, snapSearchBtn, snapSearch)
+
+	rebuildSnapFilter("")
+
+	snapTable = widget.NewTable(
+		// ahora sólo filas de datos, sin fila 0 de header
+		func() (int, int) { return len(filterSnapshots), 6 },
+		func() fyne.CanvasObject { return widget.NewLabel("") },
+		func(id widget.TableCellID, o fyne.CanvasObject) {
+			l := o.(*widget.Label)
+			l.Wrapping = fyne.TextTruncate
+
+			row := id.Row
+			if row < 0 || row >= len(filterSnapshots) {
+				l.SetText("")
+				return
+			}
+
+			s := filterSnapshots[row]
+			switch id.Col {
+			case 0:
+				l.SetText(s.ShortID)
+			case 1:
+				l.SetText(s.Time.Format("02/01/2006"))
+			case 2:
+				l.SetText(s.Time.Format("15:04:05"))
+			case 3:
+				l.SetText(s.Hostname)
+			case 4:
+				l.SetText(strconv.Itoa(len(s.Paths)))
+			case 5:
+				l.SetText(strings.Join(s.Tags, ","))
+			default:
+				l.SetText("")
+			}
+		},
+	)
+
+	// Usar header nativo de Table para permitir resize por drag
+	snapTable.ShowHeaderRow = true
+	snapTable.CreateHeader = func() fyne.CanvasObject {
+		return widget.NewLabel("")
+	}
+	snapTable.UpdateHeader = func(id widget.TableCellID, o fyne.CanvasObject) {
+		l := o.(*widget.Label)
+		l.Wrapping = fyne.TextTruncate
+
+		// id.Row < 0 == celda de header
+		if id.Row < 0 {
+			switch id.Col {
+			case 0:
+				l.SetText("ID")
+			case 1:
+				l.SetText("Date")
+			case 2:
+				l.SetText("Time")
+			case 3:
+				l.SetText("Host")
+			case 4:
+				l.SetText("#Paths")
+			case 5:
+				l.SetText("Tags")
+			default:
+				l.SetText("")
+			}
+		} else {
+			l.SetText("")
+		}
+	}
+
+	applySnapshotColumnWidths()
+
+	// ---- Files panel
+	fileSearch := widget.NewEntry()
+	fileSearch.SetPlaceHolder("Search files…")
+	fileSearchBtn := widget.NewButtonWithIcon("", theme.SearchIcon(), func() {})
+	fileSearchRow := container.NewBorder(nil, nil, nil, fileSearchBtn, fileSearch)
+
+	rebuildFilesFilter("")
+
+	filesTable = widget.NewTable(
+		// sólo filas de datos
+		func() (int, int) { return len(filterFiles), 5 },
+		func() fyne.CanvasObject { return widget.NewLabel("") },
+		func(id widget.TableCellID, o fyne.CanvasObject) {
+			l := o.(*widget.Label)
+			l.Wrapping = fyne.TextTruncate
+
+			row := id.Row
+			if row < 0 || row >= len(filterFiles) {
+				l.SetText("")
+				return
+			}
+
+			f := filterFiles[row]
+			switch id.Col {
+			case 0:
+				l.SetText(f.Change)
+			case 1:
+				l.SetText(f.Path)
+			case 2:
+				l.SetText(f.Size)
+			case 3:
+				l.SetText(f.MTime)
+			case 4:
+				if f.CTime == "" {
+					l.SetText("-")
+				} else {
+					l.SetText(f.CTime)
+				}
+			default:
+				l.SetText("")
+			}
+		},
+	)
+
+	// Header nativo para poder arrastrar los bordes
+	filesTable.ShowHeaderRow = true
+	filesTable.CreateHeader = func() fyne.CanvasObject {
+		return widget.NewLabel("")
+	}
+	filesTable.UpdateHeader = func(id widget.TableCellID, o fyne.CanvasObject) {
+		l := o.(*widget.Label)
+		l.Wrapping = fyne.TextTruncate
+
+		if id.Row < 0 {
+			switch id.Col {
+			case 0:
+				l.SetText("Δ")
+			case 1:
+				l.SetText("Path")
+			case 2:
+				l.SetText("Size")
+			case 3:
+				l.SetText("Modified")
+			case 4:
+				l.SetText("Created")
+			default:
+				l.SetText("")
+			}
+		} else {
+			l.SetText("")
+		}
+	}
+
+	applyFileColumnWidths()
+
+	// ---- snapshot selection hook
+	snapTable.OnSelected = func(id widget.TableCellID) {
+		if id.Row == 0 {
+			return
+		}
+		r := id.Row - 1
+		if r < 0 || r >= len(filterSnapshots) {
+			return
+		}
+		selectedSnapIdx = r
+		if selectedJobIndex < 0 || selectedJobIndex >= len(cfg.Jobs) {
+			return
+		}
+		job := cfg.Jobs[selectedJobIndex]
+		snap := filterSnapshots[selectedSnapIdx]
+		setStatusSnapshot(&job, &snap)
+		// load diff rows from cache or compute if missing
+		go func(j Job, s Snapshot) {
+			// ensure diff exists; compute if missing
+			if _, ok := getDiffRows(j, s.ShortID); !ok {
+				if _, err := computeAndStoreLatestDiff(j, cfg.ResticPath, allSnapshots); err != nil {
+					logPrintf("diff error: %v", err)
+				}
+			}
+			rows, ok := getDiffRows(j, s.ShortID)
+			if !ok {
+				// nothing to show
+				allFiles = nil
+				rebuildFilesFilter(fileSearch.Text)
+				filesTable.Refresh()
+				return
+			}
+			allFiles = rows
+			rebuildFilesFilter(fileSearch.Text)
+			// Auto-ajuste de columnas de files la primera vez que hay datos.
+			// Se calcula en base al contenido y se persiste en config.
+			if len(cfg.FileColWidths) == 0 {
+				cfg.FileColWidths = autoFileColumnWidths()
+				if err := saveConfig(cfg); err != nil && enableLogs {
+					logPrintf("could not save file column widths: %v", err)
+				}
+			}
+			applyFileColumnWidths()
+			filesTable.Refresh()
+		}(job, snap)
+	}
+
+	// ---- backup and restore buttons
+	backupBtn := widget.NewButton("Backup now", func() {
+		if selectedJobIndex < 0 || selectedJobIndex >= len(cfg.Jobs) {
+			dialog.ShowInformation("Backup", "Please select a job first.", win)
+			return
+		}
+		if cfg.ResticPath == "" {
+			dialog.ShowInformation("Restic", "Please configure Restic in Settings.", win)
+			return
+		}
+		job := cfg.Jobs[selectedJobIndex]
+
+		// Caso BitLocker: no persistimos contraseña, la pedimos (o usamos cache)
+		if job.Bitlocker {
+			promptRepoPassword(job, "Enter Password", "BitLocker & Backup Password", win, func(pw string) {
+				// Intentamos desbloquear la unidad sólo si hace falta.
+				if err := unlockBitlocker(job.Source, pw); err != nil {
+					dialog.ShowError(err, win)
+					return
+				}
+				// La misma contraseña se usa para el repo de restic.
+				setJobPassword(job.Name, pw)
+				runBackupWithPassword(job, pw)
+			})
+			return
+		}
+
+		// No BitLocker:
+		// - Si RepoPassword está configurado, lo usa restic automáticamente.
+		// - Si está vacío, se usa --insecure-no-password.
+		runBackupWithPassword(job, "")
+	})
+
+	restoreBtn := widget.NewButton("Restore", func() {
+		if selectedJobIndex < 0 || selectedJobIndex >= len(cfg.Jobs) {
+			dialog.ShowInformation("Restore", "Please select a job first.", win)
+			return
+		}
+		if selectedSnapIdx < 0 || selectedSnapIdx >= len(filterSnapshots) {
+			dialog.ShowInformation("Restore", "Please select a snapshot first.", win)
+			return
+		}
+		job := cfg.Jobs[selectedJobIndex]
+		snap := filterSnapshots[selectedSnapIdx]
+
+		doRestore := func() {
+			go func(j Job, s Snapshot) {
+				target, err := restoreSnapshot(j, cfg.ResticPath, s.ShortID, "")
+				if err != nil {
+					fyne.CurrentApp().SendNotification(&fyne.Notification{
+						Title:   "Restore failed",
+						Content: err.Error(),
+					})
+					dialog.ShowError(err, win)
+					return
+				}
+				fyne.CurrentApp().SendNotification(&fyne.Notification{
+					Title:   "Restore completed",
+					Content: fmt.Sprintf("Restored to %s", target),
+				})
+				setStatus(fmt.Sprintf("Restored %s to %s", s.ShortID, target))
+			}(job, snap)
+		}
+
+		if job.Bitlocker {
+			promptRepoPassword(job, "Enter Password", "1 Repo Password", win, func(_ string) {
+				// ya queda cacheada; restoreSnapshot usará effectivePassword
+				doRestore()
+			})
+		} else {
+			doRestore()
+		}
+	})
+	// live search hooks
+	snapSearch.OnChanged = func(s string) {
+		rebuildSnapFilter(s)
+		snapTable.Refresh()
+	}
+	fileSearch.OnChanged = func(s string) {
+		rebuildFilesFilter(s)
+		filesTable.Refresh()
+	}
+	// assemble right panels
+	snapTop := container.NewBorder(
+		container.NewHBox(backupBtn, restoreBtn), nil, nil, nil,
+		snapTable,
+	)
+	snapPanel := container.NewBorder(snapSearchRow, nil, nil, nil, snapTop)
+	filesPanel := container.NewBorder(fileSearchRow, nil, nil, nil, filesTable)
+	rightSplit := container.NewVSplit(snapPanel, filesPanel)
+	rightSplit.Offset = 0.55
+
+	// job selection hook at end to use created widgets
+	jobList.OnSelected = func(id widget.ListItemID) {
+		if int(id) < 0 || int(id) >= len(filterJobIdx) {
+			selectedJobIndex = -1
+			setStatus("No job selected")
+			return
+		}
+		selectedJobIndex = filterJobIdx[id]
+		selectedSnapIdx = -1
+		job := cfg.Jobs[selectedJobIndex]
+
+		loadSnaps := func() {
+			setStatus("Loading snapshots…")
+			prog := dialog.NewProgressInfinite("Loading snapshots", "Please wait…", win)
+			prog.Show()
+			go func(j Job) {
+				defer prog.Hide()
+				if enableLogs {
+					logPrintf("[ui] load snapshots for job=%s", j.Name)
+				}
+				snaps, err := listSnapshots(j, cfg.ResticPath)
+				if err != nil {
+					dialog.ShowError(err, win)
+					return
+				}
+				allSnapshots = snaps
+				rebuildSnapFilter(snapSearch.Text)
+				snapTable.Refresh()
+				// Si el usuario todavía no tiene anchos personalizados,
+				// calculamos autoajuste de columnas de snapshots y lo guardamos.
+				if len(cfg.SnapColWidths) == 0 {
+					cfg.SnapColWidths = autoSnapshotColumnWidths()
+					if err := saveConfig(cfg); err != nil && enableLogs {
+						logPrintf("could not save snapshot column widths: %v", err)
+					}
+				}
+				applySnapshotColumnWidths()
+				// resetear vista de archivos al cambiar de job
+				allFiles = nil
+				rebuildFilesFilter(fileSearch.Text)
+				filesTable.Refresh()
+				setStatusJob(&j)
+			}(job)
+		}
+
+		// Para jobs BitLocker, primero aseguramos contraseña (cache) para restic.
+		if job.Bitlocker {
+			promptRepoPassword(job, "Enter Password", "Bitlocker Password", win, func(_ string) {
+				loadSnaps()
+			})
+		} else {
+			loadSnaps()
+		}
+	}
+
+	// auto-select first job if available
+	if len(cfg.Jobs) > 0 && len(filterJobIdx) > 0 {
+		jobList.Select(0)
+	}
+	// top bar with about button on right
+	topBar := container.NewBorder(nil, nil, nil, aboutBtn, nil)
+	mainSplit := container.NewHSplit(left, rightSplit)
+	mainSplit.Offset = 0.32
+	root := container.NewBorder(topBar, statusLabel, nil, nil, mainSplit)
+	win.SetContent(root)
+	setStatus("Ready")
+	return win
+}
+
+// runBackupWithPassword runs a backup for the currently selected job using
+// the provided password. It shows a progress dialog and on success reloads
+// the snapshot list and computes the latest diff. If password is empty the
+// job's RepoPassword is used.
+func runBackupWithPassword(job Job, password string) {
+	w := fyne.CurrentApp().Driver().AllWindows()[0]
+	prog := dialog.NewProgress("Backup in progress", fmt.Sprintf("Backing up %s…", job.Name), w)
+	prog.SetValue(0)
+	prog.Show()
+	go func() {
+		t := time.NewTicker(500 * time.Millisecond)
+		defer t.Stop()
+		done := make(chan error, 1)
+		go func() {
+			err := doBackup(job, cfg.ResticPath, password, func(msg string) {
+				if enableLogs {
+					logPrintf("[backup] %s", msg)
+				}
+			})
+			done <- err
+		}()
+		val := 0.0
+		for {
+			select {
+			case err := <-done:
+				prog.SetValue(1.0)
+				prog.Hide()
+				if err != nil {
+					dialog.ShowError(err, w)
+				} else {
+					fyne.CurrentApp().SendNotification(&fyne.Notification{
+						Title:   "Backup completed",
+						Content: fmt.Sprintf("Backup for %s finished.", job.Name),
+					})
+					// refresh snapshots
+					go func() {
+						snaps, e := listSnapshots(job, cfg.ResticPath)
+						if e == nil {
+							allSnapshots = snaps
+							rebuildSnapFilter("")
+							if snapTable != nil {
+								snapTable.Refresh()
+							}
+							// compute diff for newest snapshot
+							if _, err2 := computeAndStoreLatestDiff(job, cfg.ResticPath, snaps); err2 != nil {
+								logPrintf("diff computation failed: %v", err2)
+							}
+						}
+					}()
+				}
+				// update live backups (in case retention settings changed)
+				startLiveBackups(cfg.ResticPath)
+				return
+			case <-t.C:
+				val += 0.02
+				if val > 0.95 {
+					val = 0.95
+				}
+				prog.SetValue(val)
+			}
+		}
+	}()
+}
+
+// setStatusJob updates the status bar to reflect the selected job.
+func setStatusJob(job *Job) {
+	if job == nil {
+		setStatus("No job selected")
+		return
+	}
+	setStatus(fmt.Sprintf("Job: %s | Source: %s | Dest: %s", job.Name, job.Source, job.Destination))
+}
+
+// setStatusSnapshot updates the status bar to reflect the selected snapshot.
+func setStatusSnapshot(job *Job, s *Snapshot) {
+	if job == nil {
+		setStatusJob(nil)
+		return
+	}
+	if s == nil {
+		setStatusJob(job)
+		return
+	}
+	setStatus(fmt.Sprintf("Job: %s | Snapshot: %s @ %s", job.Name, s.ShortID, s.Time.Format("02/01/2006 15:04:05")))
+}
+
+// rebuildJobFilter updates the filterJobIdx slice based on the search query.
+// It is used to filter jobs by name, source or destination.
+func rebuildJobFilter(q string) {
+	filterJobIdx = filterJobIdx[:0]
+	qq := strings.ToLower(strings.TrimSpace(q))
+	for i, j := range cfg.Jobs {
+		if qq == "" ||
+			strings.Contains(strings.ToLower(j.Name), qq) ||
+			strings.Contains(strings.ToLower(j.Source), qq) ||
+			strings.Contains(strings.ToLower(j.Destination), qq) {
+			filterJobIdx = append(filterJobIdx, i)
+		}
+	}
+}
+
+// rebuildSnapFilter updates the filtered snapshot list based on the search query.
+func rebuildSnapFilter(q string) {
+	filterSnapQuery = strings.ToLower(strings.TrimSpace(q))
+	filterSnapshots = filterSnapshots[:0]
+	for _, s := range allSnapshots {
+		match := filterSnapQuery == "" ||
+			strings.Contains(strings.ToLower(s.ShortID), filterSnapQuery) ||
+			strings.Contains(strings.ToLower(s.Hostname), filterSnapQuery)
+		if !match {
+			for _, p := range s.Paths {
+				if strings.Contains(strings.ToLower(p), filterSnapQuery) {
+					match = true
+					break
+				}
+			}
+		}
+		if match {
+			filterSnapshots = append(filterSnapshots, s)
+		}
+	}
+}
+
+// rebuildFilesFilter updates the filtered file list based on the search query.
+func rebuildFilesFilter(q string) {
+	filterFileQuery = strings.ToLower(strings.TrimSpace(q))
+	filterFiles = filterFiles[:0]
+	for _, f := range allFiles {
+		if filterFileQuery == "" ||
+			strings.Contains(strings.ToLower(f.Path), filterFileQuery) ||
+			strings.Contains(strings.ToLower(f.Change), filterFileQuery) {
+			filterFiles = append(filterFiles, f)
+		}
+	}
+}
+
+// showJobEditor opens a dialog allowing the user to create or edit a job.
+// When index is -1 a new job is created. When editing a job the form fields
+// are pre-populated. On submit the configuration is saved and the job list
+// refreshed. Live backup schedules are restarted if necessary.
+func showJobEditor(parent fyne.Window, index int, jl *widget.List) {
+	var job Job
+	editing := false
+	if index >= 0 && index < len(cfg.Jobs) {
+		job = cfg.Jobs[index]
+		editing = true
+	}
+	name := widget.NewEntry()
+	name.SetText(job.Name)
+	src := widget.NewEntry()
+	src.SetText(job.Source)
+	dest := widget.NewEntry()
+	dest.SetText(job.Destination)
+	pw := widget.NewPasswordEntry()
+	pw.SetText(job.RepoPassword)
+	pw.SetPlaceHolder("Backup password (optional)")
+	bitlockerCheck := widget.NewCheck("BitLocker", nil)
+	bitlockerCheck.SetChecked(job.Bitlocker)
+	liveCheck := widget.NewCheck("Live backup", nil)
+	liveCheck.SetChecked(job.Live)
+	ival := widget.NewEntry()
+	if job.Interval > 0 {
+		ival.SetText(strconv.Itoa(job.Interval))
+	}
+	keep := widget.NewEntry()
+	if job.KeepLast > 0 {
+		keep.SetText(strconv.Itoa(job.KeepLast))
+	}
+	unit := widget.NewSelect([]string{"seconds", "minutes", "hours", "days"}, nil)
+	if job.IntervalUnit != "" {
+		unit.SetSelected(job.IntervalUnit)
+	} else {
+		unit.SetSelected("minutes")
+	}
+	browseSrc := widget.NewButton("Browse", func() {
+		openFolderDialog("Select source", func(p string) { src.SetText(p) })
+	})
+	browseDst := widget.NewButton("Browse", func() {
+		openFolderDialog("Select destination", func(p string) { dest.SetText(p) })
+	})
+
+	// FormItems para poder manipular el de password
+	pwItem := &widget.FormItem{Text: "3 Repo password", Widget: pw}
+
+	var w fyne.Window
+	form := &widget.Form{
+		Items: []*widget.FormItem{
+			{Text: "Name", Widget: name},
+			{Text: "Source", Widget: container.NewBorder(nil, nil, nil, browseSrc, src)},
+			{Text: "Destination", Widget: container.NewBorder(nil, nil, nil, browseDst, dest)},
+			pwItem,
+			{Text: "BitLocker", Widget: bitlockerCheck},
+			{Text: "Live backup", Widget: liveCheck},
+			{Text: "Interval", Widget: container.NewBorder(nil, nil, unit, nil, ival)},
+			{Text: "Retention (keep last N)", Widget: keep},
+		},
+		OnSubmit: func() {
+			if strings.TrimSpace(name.Text) == "" || strings.TrimSpace(src.Text) == "" || strings.TrimSpace(dest.Text) == "" {
+				dialog.ShowError(errors.New("name, source and destination are required"), w)
+				return
+			}
+			iv := 0
+			if ival.Text != "" {
+				iv, _ = strconv.Atoi(ival.Text)
+			}
+			kl := 0
+			if keep.Text != "" {
+				kl, _ = strconv.Atoi(keep.Text)
+			}
+
+			repoPwd := pw.Text
+			if bitlockerCheck.Checked {
+				// No persistimos contraseña cuando se usa BitLocker.
+				repoPwd = ""
+			}
+
+			n := Job{
+				Name:         name.Text,
+				Source:       src.Text,
+				Destination:  dest.Text,
+				RepoPassword: repoPwd,
+				Bitlocker:    bitlockerCheck.Checked,
+				Live:         liveCheck.Checked,
+				Interval:     iv,
+				IntervalUnit: unit.Selected,
+				KeepLast:     kl,
+			}
+			if editing {
+				cfg.Jobs[index] = n
+				// Al editar, limpiamos cualquier password cacheada anterior.
+				clearJobPassword(n.Name)
+			} else {
+				cfg.Jobs = append(cfg.Jobs, n)
+				// recordar índice del nuevo job en el slice global
+				selectedJobIndex = len(cfg.Jobs) - 1
+			}
+			if err := saveConfig(cfg); err != nil {
+				dialog.ShowError(err, w)
+				return
+			}
+			// rebuild job filter and refresh list
+			rebuildJobFilter(jobSearch.Text)
+			jl.Refresh()
+			// Si se añadió un job nuevo, seleccionarlo en la vista filtrada
+			if !editing {
+				for row, idx2 := range filterJobIdx {
+					if idx2 == selectedJobIndex {
+						jl.Select(row)
+						break
+					}
+				}
+			}
+			// restart live backups
+			startLiveBackups(cfg.ResticPath)
+			w.Close()
+		},
+		OnCancel: func() { w.Close() },
+	}
+	form.SubmitText = "Save"
+	form.CancelText = "Cancel"
+
+	// Callback para ocultar/mostrar el campo de password según BitLocker.
+	bitlockerCheck.OnChanged = func(checked bool) {
+		if checked {
+			pw.SetText("")
+			pw.Hide()
+		} else {
+			pw.Show()
+		}
+	}
+	// aplicar estado inicial
+	bitlockerCheck.OnChanged(bitlockerCheck.Checked)
+
+	w = fyne.CurrentApp().NewWindow("Job Editor")
+	w.SetContent(container.NewVScroll(form))
+	w.Resize(fyne.NewSize(600, 420))
+	w.Show()
+}
+
+// showSettings presents a form to configure the restic executable location
+// and the autostart option. Changes are persisted immediately on submit.
+func showSettings(parent fyne.Window) {
+	resticEntry := widget.NewEntry()
+	resticEntry.SetText(cfg.ResticPath)
+	autoStartCheck := widget.NewCheck("Launch on startup", func(bool) {})
+	autoStartCheck.SetChecked(cfg.AutoStart)
+	browse := widget.NewButton("Browse", func() {
+		openFileDialog("Select restic executable", func(p string) { resticEntry.SetText(p) })
+	})
+	var w fyne.Window
+	form := &widget.Form{
+		Items: []*widget.FormItem{
+			{Text: "Restic executable", Widget: container.NewBorder(nil, nil, nil, browse, resticEntry)},
+			{Text: "Autostart", Widget: autoStartCheck},
+		},
+		OnSubmit: func() {
+			p := strings.TrimSpace(resticEntry.Text)
+			if p == "" {
+				dialog.ShowError(errors.New("select restic executable"), w)
+				return
+			}
+			abs, err := filepath.Abs(p)
+			if err != nil {
+				dialog.ShowError(err, w)
+				return
+			}
+			if fi, err := os.Stat(abs); err != nil || fi.IsDir() {
+				dialog.ShowError(errors.New("invalid restic path"), w)
+				return
+			}
+			cfg.ResticPath = abs
+			cfg.AutoStart = autoStartCheck.Checked
+			if err := saveConfig(cfg); err != nil {
+				dialog.ShowError(err, w)
+				return
+			}
+			if cfg.AutoStart {
+				if err := installAutostart(); err != nil && enableLogs {
+					logPrintf("autostart install failed: %v", err)
+				}
+			}
+			// restart live backups with new restic path
+			startLiveBackups(cfg.ResticPath)
+			w.Close()
+		},
+		OnCancel: func() { w.Close() },
+	}
+	form.SubmitText = "Save"
+	form.CancelText = "Cancel"
+	w = fyne.CurrentApp().NewWindow("Settings")
+	w.SetContent(container.NewVScroll(form))
+	w.Resize(fyne.NewSize(560, 220))
+	w.Show()
+}
+
+// applySnapshotColumnWidths sets the widths of the snapshot table columns
+// using the values stored in the configuration. When no widths have been
+// persisted yet it falls back to sensible defaults that match the original
+// fixed layout. This function does not modify the configuration.
+func applySnapshotColumnWidths() {
+	if snapTable == nil {
+		return
+	}
+	const snapCols = 6
+	widths := cfg.SnapColWidths
+	if len(widths) != snapCols {
+		// fallback to the previous fixed widths so the table is usable
+		widths = []float32{110, 90, 85, 160, 70, 250}
+	}
+	for col, w := range widths {
+		snapTable.SetColumnWidth(col, w)
+	}
+}
+
+// applyFileColumnWidths sets the widths of the file diff table columns using
+// the values stored in the configuration. When no widths exist the previous
+// fixed values are used. This function does not modify the configuration.
+func applyFileColumnWidths() {
+	if filesTable == nil {
+		return
+	}
+	const fileCols = 5
+	widths := cfg.FileColWidths
+	if len(widths) != fileCols {
+		// fallback to the previous fixed widths so the table is usable
+		widths = []float32{30, 600, 80, 150, 150}
+	}
+	for col, w := range widths {
+		filesTable.SetColumnWidth(col, w)
+	}
+}
+
+// measureTextWidth returns an approximate pixel width for the given string
+// using the current theme text size plus a small padding so that content does
+// not touch the cell borders.
+func measureTextWidth(s string) float32 {
+	if s == "" {
+		s = " "
+	}
+	sz := fyne.MeasureText(s, theme.TextSize(), fyne.TextStyle{})
+	// add padding on both sides
+	return sz.Width + 16
+}
+
+// autoSnapshotColumnWidths inspects the snapshot data and computes column
+// widths large enough to hold the visible content (ID, dates, host, etc.)
+// without truncation where possible. The result can be stored in Config and
+// reused on future runs.
+func autoSnapshotColumnWidths() []float32 {
+	const snapCols = 6
+	widths := make([]float32, snapCols)
+	headers := []string{"ID", "Date", "Time", "Host", "#Paths", "Tags"}
+	for i, h := range headers {
+		w := measureTextWidth(h)
+		if w > widths[i] {
+			widths[i] = w
+		}
+	}
+	for _, s := range filterSnapshots {
+		values := []string{
+			s.ShortID,
+			s.Time.Format("02/01/2006"),
+			s.Time.Format("15:04:05"),
+			s.Hostname,
+			strconv.Itoa(len(s.Paths)),
+			strings.Join(s.Tags, ","),
+		}
+		for i, v := range values {
+			w := measureTextWidth(v)
+			if w > widths[i] {
+				widths[i] = w
+			}
+		}
+	}
+	// enforce reasonable minimums and maximums so columns stay readable
+	min := []float32{80, 80, 70, 120, 60, 120}
+	const maxWidth float32 = 700
+	for i := range widths {
+		if widths[i] < min[i] {
+			widths[i] = min[i]
+		}
+		if widths[i] > maxWidth {
+			widths[i] = maxWidth
+		}
+	}
+	return widths
+}
+
+// autoFileColumnWidths inspects the file diff data and computes column widths
+// based on the visible content. It is typically called after allFiles /
+// filterFiles have been populated.
+func autoFileColumnWidths() []float32 {
+	const fileCols = 5
+	widths := make([]float32, fileCols)
+	headers := []string{"Δ", "Path", "Size", "Modified", "Created"}
+	for i, h := range headers {
+		w := measureTextWidth(h)
+		if w > widths[i] {
+			widths[i] = w
+		}
+	}
+	for _, f := range filterFiles {
+		values := []string{
+			f.Change,
+			f.Path,
+			f.Size,
+			f.MTime,
+			f.CTime,
+		}
+		for i, v := range values {
+			w := measureTextWidth(v)
+			if w > widths[i] {
+				widths[i] = w
+			}
+		}
+	}
+	// enforce minimums and maximums; the path column is allowed to be wider
+	min := []float32{30, 150, 70, 120, 120}
+	max := []float32{80, 800, 200, 300, 300}
+	for i := range widths {
+		if widths[i] < min[i] {
+			widths[i] = min[i]
+		}
+		if widths[i] > max[i] {
+			widths[i] = max[i]
+		}
+	}
+	return widths
+}
