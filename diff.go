@@ -329,3 +329,40 @@ func diffSummary(job Job, snapshotID string) (added, modified, deleted int, ok b
 	}
 	return added, modified, deleted, true
 }
+
+func restoredSnapshotKey(snapshotID string) string {
+	return snapshotID + " (restored)"
+}
+
+// computeAndStoreRestoreDiff calcula el diff de un restore:
+//
+//   - curID: el snapshot que se restauró.
+//   - prevID: la versión cronológicamente previa al momento del restore
+//     (último snapshot de la lista "snaps").
+//   - Guarda el resultado en diffcache.json bajo la clave "<ID> (restored)".
+func computeAndStoreRestoreDiff(job Job, resticPath string, snaps []Snapshot, restoredID string) (string, error) {
+	if len(snaps) == 0 {
+		return "", nil
+	}
+
+	// "Versión cronológicamente previa": el snapshot más nuevo existente
+	// antes de registrar el restore.
+	prevID := snaps[len(snaps)-1].ShortID
+
+	// Si el único snapshot que existe es el mismo que se restauró,
+	// no tiene sentido diffs: usamos prev vacío (sin cambios).
+	if len(snaps) == 1 && prevID == restoredID {
+		prevID = ""
+	}
+
+	rows, err := computeDiff(job, resticPath, restoredID, prevID)
+	if err != nil {
+		return "", err
+	}
+
+	key := restoredSnapshotKey(restoredID)
+	if err := storeDiffRows(job, key, rows); err != nil {
+		return "", err
+	}
+	return key, nil
+}

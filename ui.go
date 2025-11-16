@@ -348,7 +348,14 @@ func buildUI(myApp fyne.App) fyne.Window {
 
 			switch id.Col {
 			case 0:
-				t1.Text = s.ShortID
+				idText := s.ShortID
+				if selectedJobIndex >= 0 && selectedJobIndex < len(cfg.Jobs) {
+					jobName := cfg.Jobs[selectedJobIndex].Name
+					if rt, ok := snapshotRestoreTime(jobName, s.ShortID); ok && s.Time.Equal(rt) {
+						idText = fmt.Sprintf("%s (restored)", s.ShortID)
+					}
+				}
+				t1.Text = idText
 			case 1:
 				t1.Text = s.Time.Format("02/01/2006")
 			case 2:
@@ -363,7 +370,14 @@ func buildUI(myApp fyne.App) fyne.Window {
 					return
 				}
 				job := cfg.Jobs[selectedJobIndex]
-				added, modified, deleted, ok := diffSummary(job, s.ShortID)
+
+				// Si es una fila de "restored", buscamos el diff con la clave "<id> (restored)".
+				keyID := s.ShortID
+				if rt, ok := snapshotRestoreTime(job.Name, s.ShortID); ok && s.Time.Equal(rt) {
+					keyID = restoredSnapshotKey(s.ShortID)
+				}
+
+				added, modified, deleted, ok := diffSummary(job, keyID)
 				if !ok {
 					// aún no hay diff cacheado para este snapshot
 					return
@@ -531,13 +545,23 @@ func buildUI(myApp fyne.App) fyne.Window {
 		setStatusSnapshot(&job, &snap)
 		// load diff rows from cache or compute if missing
 		go func(j Job, s Snapshot) {
-			// ensure diff exists; compute if missing
-			if _, ok := getDiffRows(j, s.ShortID); !ok {
-				if _, err := computeAndStoreLatestDiff(j, cfg.ResticPath, allSnapshots); err != nil {
-					logPrintf("diff error: %v", err)
+			// Elegimos la clave de diff: normal o "<id> (restored)".
+			keyID := s.ShortID
+			if rt, ok := snapshotRestoreTime(j.Name, s.ShortID); ok && s.Time.Equal(rt) {
+				keyID = restoredSnapshotKey(s.ShortID)
+			}
+
+			// Para restores NUNCA llamamos computeAndStoreLatestDiff (no queremos borrar snapshots ni tocar last-check).
+			if _, ok := getDiffRows(j, keyID); !ok {
+				// Sólo para snapshots "normales" calculamos el último diff automáticamente.
+				if keyID == s.ShortID {
+					if _, err := computeAndStoreLatestDiff(j, cfg.ResticPath, allSnapshots); err != nil {
+						logPrintf("diff error: %v", err)
+					}
 				}
 			}
-			rows, ok := getDiffRows(j, s.ShortID)
+
+			rows, ok := getDiffRows(j, keyID)
 			if !ok {
 				// nothing to show
 				allFiles = nil
@@ -603,9 +627,9 @@ func buildUI(myApp fyne.App) fyne.Window {
 		snap := filterSnapshots[selectedSnapIdx]
 
 		// Ejecuta el restore real (ya habiendo pedido contraseña si hace falta).
+		// Ejecuta el restore real (ya habiendo pedido contraseña si hace falta).
 		doRestore := func() {
 			go func(j Job, s Snapshot) {
-				// restoreSnapshot ahora devuelve la ruta Source restaurada.
 				target, err := restoreSnapshot(j, cfg.ResticPath, s.ShortID, "")
 				if err != nil {
 					fyne.CurrentApp().SendNotification(&fyne.Notification{
@@ -616,28 +640,44 @@ func buildUI(myApp fyne.App) fyne.Window {
 					return
 				}
 
-				// Notificación y barra de estado indicando restore sobre Source.
 				fyne.CurrentApp().SendNotification(&fyne.Notification{
 					Title:   "Restore completed",
 					Content: fmt.Sprintf("Snapshot %s restored to source %s", s.ShortID, target),
 				})
 				setStatus(fmt.Sprintf("Snapshot %s restored to %s", s.ShortID, target))
 
-				// Volvemos a leer los snapshots para ver la nota nueva en la columna Tags.
+				// Volvemos a leer los snapshots reales desde restic.
 				snaps, e := listSnapshots(j, cfg.ResticPath)
-				if e == nil {
-					allSnapshots = snaps
-					rebuildSnapFilter(snapSearch.Text)
-					if snapTable != nil {
-						snapTable.Refresh()
+				if e != nil {
+					if enableLogs {
+						logPrintf("listSnapshots after restore failed: %v", e)
 					}
-				} else if enableLogs {
-					logPrintf("listSnapshots after restore failed: %v", e)
+					return
 				}
+
+				// Calculamos y persistimos el diff del restore contra la versión
+				// cronológicamente previa (último snapshot de 'snaps').
+				if _, err := computeAndStoreRestoreDiff(j, cfg.ResticPath, snaps, s.ShortID); err != nil && enableLogs {
+					logPrintf("computeAndStoreRestoreDiff failed for job=%s snapshot=%s: %v", j.Name, s.ShortID, err)
+				}
+
+				// Registramos el restore en memoria con el timestamp actual.
+				now := time.Now()
+				markSnapshotRestored(j.Name, s.ShortID, now)
+
+				// Reconstruimos la lista con filas virtuales para todos los restores.
+				snaps = appendVirtualRestores(j, snaps)
+
+				allSnapshots = snaps
+				rebuildSnapFilter(snapSearch.Text)
+				if snapTable != nil {
+					snapTable.Refresh()
+				}
+
 			}(job, snap)
 		}
 
-		// Confirmación explícita porque ahora se pisa la carpeta Source.
+		// Confirmación explícita: ahora se pisa la carpeta Source.
 		confirmAndRun := func() {
 			msg := fmt.Sprintf(
 				"Restore snapshot %s into Source path?\n\nSource: %s\n\n"+
@@ -655,7 +695,7 @@ func buildUI(myApp fyne.App) fyne.Window {
 		}
 
 		if job.Bitlocker {
-			// Para BitLocker, primero nos aseguramos de tener contraseña (cache).
+			// Para BitLocker, primero nos aseguramos de tener contraseña cacheada.
 			promptRepoPassword(job, "Enter Password", "1 Repo Password", win, func(_ string) {
 				confirmAndRun()
 			})
@@ -893,7 +933,8 @@ func runBackupWithPassword(job Job, password string) {
 							return
 						}
 
-						// 4) actualizar la UI con la lista real y el Last check recién escrito
+						// 4) actualizar la UI con la lista real + restores virtuales y el Last check recién escrito
+						snaps = appendVirtualRestores(j, snaps)
 						allSnapshots = snaps
 						// respetar el filtro actual de snapshots
 						rebuildSnapFilter(filterSnapQuery)
@@ -976,6 +1017,29 @@ func rebuildSnapFilter(q string) {
 			filterSnapshots = append(filterSnapshots, s)
 		}
 	}
+}
+
+// appendVirtualRestores toma la lista "real" de snapshots de restic
+// y agrega una fila "virtual" por cada snapshot restaurado en esta sesión.
+// Esto evita que, después de un backup, se pierda visualmente el snapshot
+// "<ID> (restored)" en la tabla de snapshots.
+func appendVirtualRestores(job Job, snaps []Snapshot) []Snapshot {
+	// Si no tenemos restores registrados, devolvemos tal cual.
+	if restoredSnapshots == nil {
+		return snaps
+	}
+
+	// Por cada snapshot real, si existe un restoreTime registrado,
+	// creamos una copia "virtual" con la hora de restore y sin tags.
+	for _, s := range snaps {
+		if rt, ok := snapshotRestoreTime(job.Name, s.ShortID); ok {
+			c := s
+			c.Time = rt
+			c.Tags = nil // en restores no mostramos tags
+			snaps = append(snaps, c)
+		}
+	}
+	return snaps
 }
 
 // rebuildFilesFilter updates the filtered file list based on the search query.

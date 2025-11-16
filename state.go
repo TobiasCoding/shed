@@ -5,6 +5,7 @@ import (
 	"log"
 	"strings"
 	"sync"
+	"time"
 
 	"fyne.io/fyne/v2/widget"
 )
@@ -38,12 +39,41 @@ var (
 	snapTable       *widget.Table
 	selectedSnapIdx = -1
 
+	// jobName -> snapshotID -> restoreTime (sólo para esta sesión)
+	restoredSnapshots map[string]map[string]time.Time
+
 	// Estado de UI: si estamos recalculando el Last check para un job,
 	// mostramos un spinner en la columna correspondiente.
 	lastCheckUpdatingJob string
 	lastCheckUpdating    bool
 	lastCheckUpdatingMu  sync.Mutex
 )
+
+// markSnapshotRestored marca un snapshot como restaurado para un job dado
+// y recuerda el timestamp exacto del restore (sólo en memoria).
+func markSnapshotRestored(jobName, snapshotID string, t time.Time) {
+	if restoredSnapshots == nil {
+		restoredSnapshots = make(map[string]map[string]time.Time)
+	}
+	if restoredSnapshots[jobName] == nil {
+		restoredSnapshots[jobName] = make(map[string]time.Time)
+	}
+	restoredSnapshots[jobName][snapshotID] = t
+}
+
+// snapshotRestoreTime devuelve el timestamp de restore para ese snapshot
+// (en esta sesión), o false si nunca se restauró.
+func snapshotRestoreTime(jobName, snapshotID string) (time.Time, bool) {
+	if restoredSnapshots == nil {
+		return time.Time{}, false
+	}
+	m := restoredSnapshots[jobName]
+	if m == nil {
+		return time.Time{}, false
+	}
+	t, ok := m[snapshotID]
+	return t, ok
+}
 
 // File diff filtering and selection
 var (
