@@ -7,6 +7,7 @@ package main
 import (
 	_ "embed"
 	"flag"
+	"fmt"
 	"io"
 	"log"
 	"os"
@@ -22,11 +23,13 @@ import (
 var iconData []byte
 
 // main es el punto de entrada. Configura logs, carga configuración,
-// detecta restic, inicia los backups en vivo y levanta la UI.
+// detecta/prepara restic, inicia los backups en vivo y levanta la UI.
 func main() {
 	// parse command line flags
 	logs := flag.Bool("logs", false, "enable verbose logging")
+	showVersion := flag.Bool("version", false, "print version and exit")
 	flag.Parse()
+
 	if *logs {
 		enableLogs = true
 		log.SetOutput(os.Stdout)
@@ -34,17 +37,32 @@ func main() {
 		log.SetOutput(io.Discard)
 	}
 
+	// Si se invoca sólo para mostrar versión, no hacemos más nada (no UI, no restic).
+	if *showVersion {
+		fmt.Printf("Shed %s\n", appVersion)
+		return
+	}
+
 	// load configuration from disk (creates cfg and cfgFile)
 	cfg = loadConfig()
 
-	// auto-detect restic if not already configured
-	if cfg.ResticPath == "" {
-		cfg.ResticPath = detectRestic("")
-		_ = saveConfig(cfg)
+	// Actualizar versión en config si cambió.
+	initAppVersion()
+
+	// Aseguramos que haya un binario de restic disponible:
+	// - si restic_path está definido y existe, lo usamos;
+	// - si no, lo descargamos/verificamos/descomprimimos en el dir de config.
+	resticPath, err := ensureResticBinary()
+	if err != nil {
+		log.Fatalf("could not prepare restic binary: %v", err)
 	}
+	cfg.ResticPath = resticPath
 
 	// start live backups if any job has Live enabled
-	startLiveBackups(cfg.ResticPath)
+	startLiveBackups(resticPath)
+
+	// Chequeo silencioso de updates en segundo plano (no bloquea la UI).
+	go CheckForUpdatesSilent()
 
 	// initialise Fyne application
 	myApp := app.NewWithID("Shed")

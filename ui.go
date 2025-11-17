@@ -230,7 +230,12 @@ func buildUI(myApp fyne.App) fyne.Window {
 
 	// about button anchored to top right
 	aboutBtn := widget.NewButton("About", func() {
-		dialog.ShowInformation("About", "Shed v1.0\nDeveloper: tobiasrimoli@protonmail.com", win)
+		ver := cfg.Version
+		if strings.TrimSpace(ver) == "" {
+			ver = appVersion
+		}
+		msg := fmt.Sprintf("Shed v%s\nDeveloper: tobiasrimoli@protonmail.com", ver)
+		dialog.ShowInformation("About", msg, win)
 	})
 
 	statusLabel = widget.NewLabel("Ready")
@@ -253,7 +258,9 @@ func buildUI(myApp fyne.App) fyne.Window {
 			o.(*widget.Label).SetText(cfg.Jobs[idx].Name)
 		},
 	)
-	selectedJobIndex := -1
+	// usar la variable global; inicializarla acá
+	selectedJobIndex = -1
+
 	addBtn := widget.NewButtonWithIcon("Add Job", theme.ContentAddIcon(), func() {
 		showJobEditor(win, -1, jobList)
 	})
@@ -424,41 +431,59 @@ func buildUI(myApp fyne.App) fyne.Window {
 	)
 
 	// usar fila de header nativa de Table para permitir resize por drag
+	// usar fila de header nativa de Table para permitir resize por drag
 	snapTable.ShowHeaderRow = true
 	snapTable.CreateHeader = func() fyne.CanvasObject {
-		return widget.NewLabel("")
-	}
-	snapTable.ShowHeaderRow = true
-	snapTable.CreateHeader = func() fyne.CanvasObject {
-		return widget.NewLabel("")
+		btn := widget.NewButton("", nil)
+		btn.Importance = widget.LowImportance
+		btn.Alignment = widget.ButtonAlignLeading
+		return btn
 	}
 	snapTable.UpdateHeader = func(id widget.TableCellID, o fyne.CanvasObject) {
-		l := o.(*widget.Label)
-		l.Wrapping = fyne.TextTruncate
+		btn := o.(*widget.Button)
 
 		if id.Row < 0 {
-			switch id.Col {
+			col := id.Col
+			text := ""
+			sortable := false
+
+			switch col {
 			case 0:
-				l.SetText("ID")
+				text = "ID"
+				sortable = true
 			case 1:
-				l.SetText("Date")
+				text = "Date"
+				sortable = true
 			case 2:
-				l.SetText("Time")
+				text = "Time"
+				sortable = true
 			case 3:
-				l.SetText("Host")
+				text = "Host"
+				sortable = true
 			case 4:
-				l.SetText("#Paths")
+				text = "#Paths"
+				sortable = true
 			case 5:
-				l.SetText("Δ")
+				text = "Δ" // no sortable (no tenemos datos precalculados)
 			case 6:
-				l.SetText("Tags")
+				text = "Tags"
+				sortable = true
 			case 7:
-				l.SetText("Last check")
-			default:
-				l.SetText("")
+				text = "Last check"
+				sortable = true
+			}
+
+			btn.SetText(text)
+			if sortable {
+				btn.OnTapped = func() {
+					handleSnapshotHeaderClick(col)
+				}
+			} else {
+				btn.OnTapped = nil
 			}
 		} else {
-			l.SetText("")
+			btn.SetText("")
+			btn.OnTapped = nil
 		}
 	}
 
@@ -504,28 +529,42 @@ func buildUI(myApp fyne.App) fyne.Window {
 	)
 	filesTable.ShowHeaderRow = true
 	filesTable.CreateHeader = func() fyne.CanvasObject {
-		return widget.NewLabel("")
+		btn := widget.NewButton("", nil)
+		btn.Importance = widget.LowImportance
+		btn.Alignment = widget.ButtonAlignLeading
+		return btn
 	}
 	filesTable.UpdateHeader = func(id widget.TableCellID, o fyne.CanvasObject) {
-		l := o.(*widget.Label)
-		l.Wrapping = fyne.TextTruncate
+		btn := o.(*widget.Button)
+
 		if id.Row < 0 {
-			switch id.Col {
+			col := id.Col
+			text := ""
+
+			switch col {
 			case 0:
-				l.SetText("Δ")
+				text = "Δ"
 			case 1:
-				l.SetText("Path")
+				text = "Path"
 			case 2:
-				l.SetText("Size")
+				text = "Size"
 			case 3:
-				l.SetText("Modified")
+				text = "Modified"
 			case 4:
-				l.SetText("Created")
-			default:
-				l.SetText("")
+				text = "Created"
+			}
+
+			btn.SetText(text)
+			if text != "" {
+				btn.OnTapped = func() {
+					handleFilesHeaderClick(col)
+				}
+			} else {
+				btn.OnTapped = nil
 			}
 		} else {
-			l.SetText("")
+			btn.SetText("")
+			btn.OnTapped = nil
 		}
 	}
 	applyFileColumnWidths()
@@ -570,7 +609,14 @@ func buildUI(myApp fyne.App) fyne.Window {
 				return
 			}
 			allFiles = rows
+
+			// Orden por defecto: Path ascendente.
+			fileSortColumn = FileSortPath
+			fileSortAsc = true
+			sortFiles()
+
 			rebuildFilesFilter(fileSearch.Text)
+
 			// Auto-ajuste de columnas de files la primera vez que hay datos.
 			if len(cfg.FileColWidths) == 0 {
 				cfg.FileColWidths = autoFileColumnWidths()
@@ -669,6 +715,7 @@ func buildUI(myApp fyne.App) fyne.Window {
 				snaps = appendVirtualRestores(j, snaps)
 
 				allSnapshots = snaps
+				sortSnapshotsForCurrentJob()
 				rebuildSnapFilter(snapSearch.Text)
 				if snapTable != nil {
 					snapTable.Refresh()
@@ -750,8 +797,15 @@ func buildUI(myApp fyne.App) fyne.Window {
 					return
 				}
 				allSnapshots = snaps
+
+				// Orden por defecto: Last check ascendente.
+				snapSortColumn = SnapSortLastCheck
+				snapSortAsc = true
+				sortSnapshotsForCurrentJob()
+
 				rebuildSnapFilter(snapSearch.Text)
 				snapTable.Refresh()
+
 				// Si el usuario todavía no tiene anchos personalizados,
 				// calculamos autoajuste de columnas de snapshots y lo guardamos.
 				if len(cfg.SnapColWidths) == 0 {
@@ -936,11 +990,16 @@ func runBackupWithPassword(job Job, password string) {
 						// 4) actualizar la UI con la lista real + restores virtuales y el Last check recién escrito
 						snaps = appendVirtualRestores(j, snaps)
 						allSnapshots = snaps
+
+						// manteniendo columna/sentido actuales
+						sortSnapshotsForCurrentJob()
+
 						// respetar el filtro actual de snapshots
 						rebuildSnapFilter(filterSnapQuery)
 						if snapTable != nil {
 							snapTable.Refresh()
 						}
+
 					}(job)
 				}
 
@@ -1052,6 +1111,77 @@ func rebuildFilesFilter(q string) {
 			strings.Contains(strings.ToLower(f.Change), filterFileQuery) {
 			filterFiles = append(filterFiles, f)
 		}
+	}
+}
+
+// handleSnapshotHeaderClick cambia columna/sentido de orden y refresca tabla.
+func handleSnapshotHeaderClick(col int) {
+	var newCol SnapSortColumn
+
+	switch col {
+	case 0:
+		newCol = SnapSortID
+	case 1:
+		newCol = SnapSortDate
+	case 2:
+		newCol = SnapSortTime
+	case 3:
+		newCol = SnapSortHost
+	case 4:
+		newCol = SnapSortPaths
+	case 6:
+		newCol = SnapSortTags
+	case 7:
+		newCol = SnapSortLastCheck
+	default:
+		// Δ u otras columnas no ordenables
+		return
+	}
+
+	if snapSortColumn == newCol {
+		snapSortAsc = !snapSortAsc
+	} else {
+		snapSortColumn = newCol
+		snapSortAsc = true
+	}
+
+	sortSnapshotsForCurrentJob()
+	rebuildSnapFilter(filterSnapQuery)
+	if snapTable != nil {
+		snapTable.Refresh()
+	}
+}
+
+// handleFilesHeaderClick cambia columna/sentido de orden y refresca tabla de files.
+func handleFilesHeaderClick(col int) {
+	var newCol FileSortColumn
+
+	switch col {
+	case 0:
+		newCol = FileSortChange
+	case 1:
+		newCol = FileSortPath
+	case 2:
+		newCol = FileSortSize
+	case 3:
+		newCol = FileSortMTime
+	case 4:
+		newCol = FileSortCTime
+	default:
+		return
+	}
+
+	if fileSortColumn == newCol {
+		fileSortAsc = !fileSortAsc
+	} else {
+		fileSortColumn = newCol
+		fileSortAsc = true
+	}
+
+	sortFiles()
+	rebuildFilesFilter(filterFileQuery)
+	if filesTable != nil {
+		filesTable.Refresh()
 	}
 }
 
@@ -1213,6 +1343,11 @@ func showJobEditor(parent fyne.Window, index int, jl *widget.List) {
 
 // showSettings presents a form to configure the restic executable location
 // and the autostart option. Changes are persisted immediately on submit.
+// showSettings presents a form to configure the restic executable location
+// and the autostart option. Changes are persisted immediately on submit.
+//
+// Además muestra el estado de actualización (último control) y un botón
+// para chequear/actualizar.
 func showSettings(parent fyne.Window) {
 	resticEntry := widget.NewEntry()
 	resticEntry.SetText(cfg.ResticPath)
@@ -1225,11 +1360,42 @@ func showSettings(parent fyne.Window) {
 		openFileDialog("Select restic executable", func(p string) { resticEntry.SetText(p) })
 	})
 
+	// ---- Sección de actualización
+	statusText := cfg.LastUpdateStatus
+	if statusText == "" {
+		statusText = "Never checked"
+	}
+	statusLabel := widget.NewLabel(statusText)
+
+	lastCheckStr := "Never"
+	if !cfg.LastUpdateCheck.IsZero() {
+		lastCheckStr = cfg.LastUpdateCheck.Format("02/01/2006 15:04:05")
+	}
+	lastCheckLabel := widget.NewLabel(lastCheckStr)
+
+	checkBtn := widget.NewButton("Check for updates", func() {
+		CheckForUpdatesDialog(parent)
+		// El callback actualiza cfg y muestra diálogos; la próxima vez que se
+		// abra Settings se verán los nuevos valores. No refrescamos en vivo
+		// aquí para mantenerlo simple.
+	})
+
+	updateBox := container.NewVBox(
+		statusLabel,
+		lastCheckLabel,
+		checkBtn,
+	)
+
 	var w fyne.Window
 	form := &widget.Form{
 		Items: []*widget.FormItem{
-			{Text: "Restic executable", Widget: container.NewBorder(nil, nil, nil, browse, resticEntry)},
+			{
+				Text: "Restic executable",
+				Widget: container.NewBorder(nil, nil, nil, browse,
+					resticEntry),
+			},
 			{Text: "Autostart", Widget: autoStartCheck},
+			{Text: "Updates", Widget: updateBox},
 		},
 		OnSubmit: func() {
 			// Validación de la ruta de restic.
@@ -1278,6 +1444,6 @@ func showSettings(parent fyne.Window) {
 
 	w = fyne.CurrentApp().NewWindow("Settings")
 	w.SetContent(container.NewVScroll(form))
-	w.Resize(fyne.NewSize(560, 220))
+	w.Resize(fyne.NewSize(560, 260))
 	w.Show()
 }

@@ -1,0 +1,6 @@
+{
+  "latest_version": "1.0.0",
+  "binaries": {
+    "windows_amd64": { "file": "shed_1.0.0_windows.exe" }
+  }
+}

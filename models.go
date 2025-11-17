@@ -9,12 +9,20 @@ import "time"
 // FileColWidths store the persisted column widths for the snapshots and
 // files tables in the UI so that user adjustments can be remembered
 // between runs.
+//
+// Version almacena la versión actual del programa (tal como la reporta
+// el flag --version). LastUpdateCheck y LastUpdateStatus registran la
+// fecha/hora del último control y el resultado (ej. "Up to date",
+// "Update available: 1.2.0", "Error: ...").
 type Config struct {
-	ResticPath    string    `json:"restic_path"`
-	AutoStart     bool      `json:"auto_start"`
-	Jobs          []Job     `json:"jobs"`
-	SnapColWidths []float32 `json:"snap_col_widths,omitempty"`
-	FileColWidths []float32 `json:"file_col_widths,omitempty"`
+	ResticPath       string    `json:"restic_path"`
+	AutoStart        bool      `json:"auto_start"`
+	Jobs             []Job     `json:"jobs"`
+	SnapColWidths    []float32 `json:"snap_col_widths,omitempty"`
+	FileColWidths    []float32 `json:"file_col_widths,omitempty"`
+	Version          string    `json:"version,omitempty"`
+	LastUpdateCheck  time.Time `json:"last_update_check,omitempty"`
+	LastUpdateStatus string    `json:"last_update_status,omitempty"`
 }
 
 // Job describes a single backup job. Each job backs up a source directory

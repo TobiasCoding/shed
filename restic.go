@@ -9,67 +9,10 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
 	"sort"
 	"strings"
 	"time"
 )
-
-// detectRestic tries to locate the restic executable. If the supplied path
-// parameter is non-empty it is checked first. Otherwise the system PATH is
-// searched for "restic" (or "restic.exe" on Windows) and a few well-known
-// installation locations on Windows. If enableLogs is true diagnostic
-// messages will be printed. On success the absolute path to the executable is
-// returned. On failure an empty string is returned.
-func detectRestic(path string) string {
-	if path != "" {
-		if abs, err := filepath.Abs(path); err == nil {
-			if _, err := os.Stat(abs); err == nil && checkRestic(abs) == nil {
-				if enableLogs {
-					logPrintf("using user-provided restic path: %q", abs)
-				}
-				return abs
-			}
-		}
-	}
-	cands := []string{}
-	if p, err := exec.LookPath("restic"); err == nil {
-		cands = append(cands, p)
-	}
-	if p, err := exec.LookPath("restic.exe"); err == nil {
-		cands = append(cands, p)
-	}
-	if runtime.GOOS == "windows" {
-		pf := os.Getenv("ProgramFiles")
-		if pf != "" {
-			for _, pat := range []string{
-				filepath.Join(pf, "restic", "restic*.exe"),
-				filepath.Join(pf, "restic*.exe"),
-			} {
-				if m, _ := filepath.Glob(pat); len(m) > 0 {
-					cands = append(cands, m...)
-				}
-			}
-		}
-	}
-	for _, c := range cands {
-		if checkRestic(c) == nil {
-			if enableLogs {
-				logPrintf("restic detected at %q", c)
-			}
-			return c
-		}
-	}
-	return ""
-}
-
-// checkRestic runs "restic version" on the given path to verify the binary
-// executes successfully within a short timeout. It returns nil on success.
-func checkRestic(path string) error {
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-	return exec.CommandContext(ctx, path, "version").Run()
-}
 
 // runRestic executes the restic binary with the supplied arguments. If a
 // password is provided it is passed via the RESTIC_PASSWORD environment

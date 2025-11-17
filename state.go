@@ -3,6 +3,8 @@ package main
 import (
 	"context"
 	"log"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -32,6 +34,7 @@ var (
 
 // Snapshot filtering and selection
 // Snapshot filtering and selection
+// Snapshot filtering and selection
 var (
 	allSnapshots    []Snapshot
 	filterSnapQuery string
@@ -47,6 +50,25 @@ var (
 	lastCheckUpdatingJob string
 	lastCheckUpdating    bool
 	lastCheckUpdatingMu  sync.Mutex
+)
+
+// Columna y sentido de orden de snapshots.
+type SnapSortColumn int
+
+const (
+	SnapSortID SnapSortColumn = iota
+	SnapSortDate
+	SnapSortTime
+	SnapSortHost
+	SnapSortPaths
+	SnapSortTags
+	SnapSortLastCheck
+)
+
+var (
+	// Por defecto ordenamos por Last check ascendente.
+	snapSortColumn = SnapSortLastCheck
+	snapSortAsc    = true
 )
 
 // markSnapshotRestored marca un snapshot como restaurado para un job dado
@@ -81,6 +103,23 @@ var (
 	filterFileQuery string
 	filterFiles     []FileRow
 	filesTable      *widget.Table
+)
+
+// Columna y sentido de orden de archivos.
+type FileSortColumn int
+
+const (
+	FileSortChange FileSortColumn = iota
+	FileSortPath
+	FileSortSize
+	FileSortMTime
+	FileSortCTime
+)
+
+var (
+	// Por defecto: Path ascendente.
+	fileSortColumn = FileSortPath
+	fileSortAsc    = true
 )
 
 // liveCancelMap holds cancellation functions for live backup goroutines
@@ -184,11 +223,12 @@ func notifyLastCheckChanged(job Job, snapshotID string) {
 	if cfg.Jobs[selectedJobIndex].Name != job.Name {
 		return
 	}
-	// Ejecución desde la goroutine de fondo:
-	// Usamos un canal o un simple go-call para pasar al hilo principal,
-	// si es que Fyne lo requiere. Pero Fyne documenta que muchos métodos
-	// son seguros para usar desde go-rutinas. :contentReference[oaicite:2]{index=2}
 	go func() {
+		// Si estamos ordenando por Last check, reordenamos antes de refrescar.
+		if snapSortColumn == SnapSortLastCheck {
+			sortSnapshotsForCurrentJob()
+			rebuildSnapFilter(filterSnapQuery)
+		}
 		snapTable.Refresh()
 	}()
 }
@@ -241,4 +281,156 @@ func logPrintf(format string, v ...interface{}) {
 	if enableLogs {
 		log.Printf(format, v...)
 	}
+}
+
+// sortSnapshotsForCurrentJob ordena allSnapshots según la columna y sentido actuales.
+func sortSnapshotsForCurrentJob() {
+	if len(allSnapshots) == 0 {
+		return
+	}
+
+	var (
+		job     Job
+		haveJob bool
+	)
+	if cfg != nil && selectedJobIndex >= 0 && selectedJobIndex < len(cfg.Jobs) {
+		job = cfg.Jobs[selectedJobIndex]
+		haveJob = true
+	}
+
+	sort.SliceStable(allSnapshots, func(i, j int) bool {
+		a := allSnapshots[i]
+		b := allSnapshots[j]
+
+		var less bool
+
+		switch snapSortColumn {
+		case SnapSortID:
+			less = strings.ToLower(a.ShortID) < strings.ToLower(b.ShortID)
+		case SnapSortDate, SnapSortTime:
+			// Ambas columnas ordenan por el timestamp completo.
+			less = a.Time.Before(b.Time)
+		case SnapSortHost:
+			less = strings.ToLower(a.Hostname) < strings.ToLower(b.Hostname)
+		case SnapSortPaths:
+			less = len(a.Paths) < len(b.Paths)
+		case SnapSortTags:
+			less = strings.ToLower(strings.Join(a.Tags, ",")) < strings.ToLower(strings.Join(b.Tags, ","))
+		case SnapSortLastCheck:
+			if !haveJob {
+				less = a.Time.Before(b.Time)
+				break
+			}
+			ta, oka := getSnapshotLastCheck(job, a.ShortID)
+			tb, okb := getSnapshotLastCheck(job, b.ShortID)
+
+			switch {
+			case !oka && !okb:
+				// si ninguno tiene Last check, usamos la fecha de snapshot.
+				less = a.Time.Before(b.Time)
+			case !oka && okb:
+				// los sin Last check van al final en orden asc.
+				less = false
+			case oka && !okb:
+				less = true
+			default:
+				less = ta.Before(tb)
+			}
+		default:
+			less = a.Time.Before(b.Time)
+		}
+
+		if snapSortAsc {
+			return less
+		}
+		return !less
+	})
+}
+
+func parseFileTime(s string) (time.Time, bool) {
+	s = strings.TrimSpace(s)
+	if s == "" || s == "-" {
+		return time.Time{}, false
+	}
+	layouts := []string{
+		"02/01/2006 15:04:05", // formato que se ve en tu screenshot
+		time.RFC3339,
+	}
+	for _, layout := range layouts {
+		if t, err := time.Parse(layout, s); err == nil {
+			return t, true
+		}
+	}
+	return time.Time{}, false
+}
+
+func parseSize(s string) int64 {
+	s = strings.TrimSpace(s)
+	if s == "" || s == "-" {
+		return 0
+	}
+	if n, err := strconv.ParseInt(s, 10, 64); err == nil {
+		return n
+	}
+	var digits strings.Builder
+	for _, r := range s {
+		if r >= '0' && r <= '9' {
+			digits.WriteRune(r)
+		} else if digits.Len() > 0 {
+			break
+		}
+	}
+	if digits.Len() == 0 {
+		return 0
+	}
+	if n, err := strconv.ParseInt(digits.String(), 10, 64); err == nil {
+		return n
+	}
+	return 0
+}
+
+// sortFiles ordena allFiles según la columna y sentido actuales.
+func sortFiles() {
+	if len(allFiles) == 0 {
+		return
+	}
+
+	sort.SliceStable(allFiles, func(i, j int) bool {
+		a := allFiles[i]
+		b := allFiles[j]
+
+		var less bool
+
+		switch fileSortColumn {
+		case FileSortChange:
+			less = strings.ToLower(a.Change) < strings.ToLower(b.Change)
+		case FileSortPath:
+			less = strings.ToLower(a.Path) < strings.ToLower(b.Path)
+		case FileSortSize:
+			less = parseSize(a.Size) < parseSize(b.Size)
+		case FileSortMTime:
+			ta, oka := parseFileTime(a.MTime)
+			tb, okb := parseFileTime(b.MTime)
+			if oka && okb {
+				less = ta.Before(tb)
+			} else {
+				less = strings.ToLower(a.MTime) < strings.ToLower(b.MTime)
+			}
+		case FileSortCTime:
+			ta, oka := parseFileTime(a.CTime)
+			tb, okb := parseFileTime(b.CTime)
+			if oka && okb {
+				less = ta.Before(tb)
+			} else {
+				less = strings.ToLower(a.CTime) < strings.ToLower(b.CTime)
+			}
+		default:
+			less = strings.ToLower(a.Path) < strings.ToLower(b.Path)
+		}
+
+		if fileSortAsc {
+			return less
+		}
+		return !less
+	})
 }

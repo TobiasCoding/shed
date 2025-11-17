@@ -74,7 +74,7 @@ go build -o shed
 On Windows:
 
 ```sh
-go build -ldflags "-H=windowsgui" -o shed.exe .
+go build -ldflags "-H=windowsgui" -o shed_1.0.0_windows.exe .
 ```
 
 The resulting binary will appear in the current directory.
