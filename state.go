@@ -3,6 +3,8 @@ package main
 import (
 	"context"
 	"log"
+	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -16,6 +18,36 @@ import (
 // command-line flag --logs and used by helper functions to decide whether
 // diagnostic messages should be printed.
 var enableLogs bool
+
+// Archivo de logs (mismo directorio que config.json).
+var (
+	logFile     *os.File
+	logFileOnce sync.Once
+)
+
+// initLogFile abre (o crea) el archivo de log en el mismo directorio que config.json.
+func initLogFile() {
+	if cfgFile == "" {
+		// Aún no sabemos dónde está el config, no podemos crear el log.
+		return
+	}
+	dir := filepath.Dir(cfgFile)
+	path := filepath.Join(dir, "shed.log")
+
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		// Si falla, simplemente dejamos que log.Printf vaya a donde esté configurado.
+		if enableLogs {
+			log.Printf("could not open log file %q: %v", path, err)
+		}
+		return
+	}
+	logFile = f
+	log.SetOutput(logFile)
+	if enableLogs {
+		log.Printf("[log] logging to %s", path)
+	}
+}
 
 // statusLabel is used by the UI to display status messages. It is initialised
 // in buildUI and may be updated from background goroutines via setStatus.
@@ -275,12 +307,14 @@ func setStatus(t string) {
 	}
 }
 
-// logPrintf prints to the standard logger when enableLogs is true. It is used
-// instead of direct log.Printf calls throughout the application.
+// logPrintf escribe logs cuando enableLogs es true. Inicializa perezosamente
+// un archivo shed.log en el mismo directorio que config.json.
 func logPrintf(format string, v ...interface{}) {
-	if enableLogs {
-		log.Printf(format, v...)
+	if !enableLogs {
+		return
 	}
+	logFileOnce.Do(initLogFile)
+	log.Printf(format, v...)
 }
 
 // sortSnapshotsForCurrentJob ordena allSnapshots según la columna y sentido actuales.

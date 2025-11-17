@@ -112,6 +112,6 @@ func getSnapshotLastCheck(job Job, snapshotID string) (time.Time, bool) {
 		return time.Time{}, false
 	}
 
-	logPrintf("getSnapshotLastCheck: HIT job=%s snapshot=%s time=%s", job.Name, snapshotID, t.Format(time.RFC3339))
+	// logPrintf("getSnapshotLastCheck: HIT job=%s snapshot=%s time=%s", job.Name, snapshotID, t.Format(time.RFC3339))
 	return t, true
 }

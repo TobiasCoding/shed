@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -18,6 +19,15 @@ import (
 )
 
 const appVersion = "1.0.0"
+
+// updateLog escribe un mensaje de log con prefijo [update].
+func updateLog(format string, v ...interface{}) {
+	if !enableLogs {
+		return
+	}
+	logFileOnce.Do(initLogFile)
+	log.Printf("[update] "+format, v...)
+}
 
 // Rutas de actualización (lado servidor).
 const (
@@ -94,9 +104,7 @@ func CheckForUpdatesSilent() {
 		cfg.LastUpdateStatus = fmt.Sprintf("Update available: v%s", info.LatestVersion)
 	}
 	_ = saveConfig(cfg)
-	if enableLogs {
-		logPrintf("[update] silent check: %s", cfg.LastUpdateStatus)
-	}
+	updateLog("silent check: %s", cfg.LastUpdateStatus)
 }
 
 // CheckForUpdatesDialog se usa desde la UI de Settings. Muestra diálogos
@@ -148,7 +156,7 @@ func checkForUpdatesCore() (*UpdateInfo, error) {
 	client := &http.Client{
 		Timeout: updateHTTPTimeout,
 	}
-
+	updateLog("requesting manifest: %s", updateManifestURL)
 	req, err := http.NewRequest("GET", updateManifestURL, nil)
 	if err != nil {
 		return nil, err
@@ -245,18 +253,14 @@ func doDownloadAndInstallUpdate(parent fyne.Window, info *UpdateInfo) {
 		finalPath := filepath.Join(exeDir, info.BinaryFile)
 
 		// 1) Descargar binario nuevo en tmpPath.
-		if enableLogs {
-			logPrintf("[update] downloading %s to %s", info.BinaryFile, tmpPath)
-		}
+		updateLog("downloading %s to %s", info.BinaryFile, tmpPath)
 		if err := downloadUpdateBinary(info.BinaryFile, tmpPath); err != nil {
 			dialog.ShowError(err, parent)
 			return
 		}
 
 		// 2) Verificar SHA256 contra SHA256SUMS.
-		if enableLogs {
-			logPrintf("[update] verifying SHA256 for %s", info.BinaryFile)
-		}
+		updateLog("verifying SHA256 for %s", info.BinaryFile)
 		if err := verifyUpdateSHA256(info.BinaryFile, tmpPath); err != nil {
 			_ = os.Remove(tmpPath)
 			dialog.ShowError(err, parent)
